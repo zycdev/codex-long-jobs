@@ -169,9 +169,10 @@ would ultimately be preferable to terminal injection.
   require compatibility updates.
 - Rebind is mandatory after the Codex process exits or the displayed thread is
   changed. Simply returning to the old pane is insufficient.
-- The supervisor and worker survive tmux failure, not machine reboot or an
-  uncatchable kill of the supervisor itself. Use systemd, a cluster scheduler,
-  or another service manager when host-level restart recovery is required.
+- The worker can finish and deliver after the supervisor alone is killed once
+  the job is running. No replacement supervisor is created, so a later worker
+  failure would no longer be detected. Machine reboot or loss of both processes
+  requires systemd, a cluster scheduler, or another service manager.
 - Native Windows is not currently supported.
 
 See [references/operations.md](references/operations.md) for the full failure

@@ -24,6 +24,11 @@ If the worker exits before terminal state, the supervisor terminates the
 validated child process group, records `worker-exit` or `worker-signal`, and
 invokes delivery. The supervisor is deliberately separate from the tmux viewer.
 
+The worker is also detached and owns normal terminal-state and delivery work.
+If the supervisor alone is killed after the worker is running, the worker and
+command continue and can still complete normally. The runtime does not start a
+replacement supervisor, so any later worker failure would have no watchdog.
+
 Run `start`, `rebind`, and `retry-delivery` outside the Codex tool sandbox with
 scoped host permission. The sandbox owns and reaps its descendants even if they
 call `setsid`; the controller refuses to start when it detects that ancestor.
@@ -114,10 +119,10 @@ producer does not deadlock on a full pipe. It then forces terminal failure even
 if the command itself returns zero. State and log paths should preferably live
 on different filesystems for large training jobs.
 
-If the entire host filesystem is full beyond the reserved state allowance, or
-the supervisor itself is killed with SIGKILL/OOM, no userspace-only wrapper can
-guarantee a completion record. Use a service manager or cluster scheduler for
-workloads requiring host-crash recovery.
+If the entire host filesystem is full beyond the reserved state allowance, the
+host reboots, or both supervisor and worker are lost, no userspace-only wrapper
+can guarantee a completion record. Use a service manager or cluster scheduler
+for workloads requiring host-crash recovery.
 
 ## Security boundaries
 
@@ -141,4 +146,6 @@ workloads requiring host-crash recovery.
   does not yet expose a stable public idle-wake API for arbitrary local tools.
 - The supervisor and worker survive tmux failure, not machine reboot. Jobs are
   host-local.
+- A running worker survives supervisor-only loss, but there is no automatic
+  supervisor replacement.
 - State reports process completion, not semantic correctness; verify artifacts.

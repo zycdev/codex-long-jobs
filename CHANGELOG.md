@@ -5,6 +5,13 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Documentation
+
+- Record real Codex TUI acceptance for same-thread resume in a different tmux
+  pane and supervisor-only SIGKILL survival.
+- Clarify that a running worker can finish after supervisor loss, but no
+  watchdog remains for a later worker failure.
+
 ## [0.2.0] - 2026-08-20
 
 ### Added
