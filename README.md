@@ -144,6 +144,36 @@ running in tmux when automatic live TUI wake-up is wanted.
 
 ## Install the Codex skill
 
+Python 3.10 or newer is required. tmux is required for live wake-up of the
+original Codex CLI TUI and for the optional log viewer. Install tmux with one
+of these methods:
+
+```bash
+# Ubuntu or Debian
+sudo apt update && sudo apt install tmux
+
+# Conda
+conda install conda-forge::tmux
+
+# Homebrew on macOS or Linux
+brew install tmux
+
+# Pixi, installed globally from conda-forge
+pixi global install --channel conda-forge tmux
+```
+
+Verify the installation, start a tmux session, and launch Codex inside it:
+
+```bash
+tmux -V
+tmux new-session -s codex
+```
+
+Then run `codex` from the shell inside the new tmux session.
+
+Without tmux, detached execution, durable state, and non-TUI delivery modes
+remain available, but the skill cannot wake an already-open Codex TUI.
+
 From an existing Codex session, a new user can ask Codex to perform the
 installation:
 
