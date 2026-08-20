@@ -1,13 +1,18 @@
 ---
 name: codex-long-jobs
-description: Run durable long-running background jobs for OpenAI Codex CLI and wake the owning tmux TUI on success or failure without model polling. Use for training, evaluations, builds, migrations, data processing, or other local commands that may outlive a Codex turn; need persistent logs and abnormal-exit detection; should survive tmux viewer failure; or must resume delivery after the original Codex session restarts.
+description: Run long-running, background, async, or detached processes from OpenAI Codex CLI and wake or resume the owning Codex session on process completion, without LLM/model polling while the job runs. Use when asked to run something in the background, start a long build, test, training job, or evaluation, not poll it, wait without wasting model turns, continue when it finishes, wake the original session, preserve logs and exit state, survive Codex or tmux viewer exit, or rebind after the original Codex thread restarts.
 ---
 
 # Codex Long Jobs
 
-Run the bundled controller for work expected to outlive the active turn. Keep
+Run the bundled controller for a long-running command, background process,
+detached job, or async job expected to outlive the active Codex CLI turn. Keep
 deterministic stages in the job command and reserve the completion turn for
 inspection, judgment, or already-authorized follow-up work.
+
+Typical triggers include "run this in the background," "this will take a long
+time," "don't poll it," "run tests in the background," "start the build and
+continue when complete," and "wake me when the process finishes."
 
 ## Start a job
 

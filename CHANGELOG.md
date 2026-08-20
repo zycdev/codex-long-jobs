@@ -7,6 +7,10 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Documentation
 
+- Clarify repository and skill metadata around Codex background jobs, detached
+  processes, no-model-polling completion, and original-session wake-up.
+- Add focused explanations of the problem, tmux wake path, use cases, lifecycle
+  boundaries, polling distinction, and frequently asked questions.
 - Record real Codex TUI acceptance for same-thread resume in a different tmux
   pane and supervisor-only SIGKILL survival.
 - Clarify that a running worker can finish after supervisor loss, but no
