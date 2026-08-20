@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Long Jobs"
+  short_description: "Run durable jobs and wake the owning Codex TUI"
+  default_prompt: "Use $codex-long-jobs to run this command durably in the background and wake the owning Codex TUI on completion without model polling."

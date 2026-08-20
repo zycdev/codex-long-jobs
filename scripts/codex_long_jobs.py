@@ -1,0 +1,1214 @@
+#!/usr/bin/env python3
+"""Durable, event-driven background jobs for Codex CLI.
+
+The worker and the user command run outside tmux.  tmux is used only as an
+optional, disposable log viewer and as a conservative transport to an owning
+Codex TUI.
+"""
+
+from __future__ import annotations
+
+import argparse
+import codecs
+import contextlib
+import datetime as dt
+import errno
+import fcntl
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from collections.abc import Callable, Iterator
+from pathlib import Path
+from typing import Any
+
+VERSION = "0.1.0"
+SCHEMA_VERSION = 1
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+THREAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,160}$")
+TERMINAL_STATUSES = {"succeeded", "failed"}
+DELIVERY_DONE = {"delivered", "disabled", "headless-dispatched"}
+BUSY_MARKERS = ("esc to interrupt", "ctrl+c to interrupt")
+
+
+class JobError(RuntimeError):
+    pass
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def state_root() -> Path:
+    override = os.environ.get("CODEX_LONG_JOBS_STATE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    return codex_home.expanduser().resolve() / "long-jobs"
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink() or not path.is_dir():
+        raise JobError(f"state path is not a real directory: {path}")
+    if hasattr(os, "getuid") and path.stat().st_uid != os.getuid():
+        raise JobError(f"state directory is not owned by the current user: {path}")
+    path.chmod(0o700)
+
+
+def ensure_state_root() -> Path:
+    root = state_root()
+    ensure_private_dir(root)
+    ensure_private_dir(root / "jobs")
+    ensure_private_dir(root / "logs")
+    return root
+
+
+def validate_name(name: str) -> str:
+    if not NAME_RE.fullmatch(name):
+        raise JobError("job name must match [A-Za-z0-9][A-Za-z0-9_.-]{0,79}")
+    return name
+
+
+def job_dir(name: str) -> Path:
+    return state_root() / "jobs" / validate_name(name)
+
+
+def state_file(name: str) -> Path:
+    return job_dir(name) / "state.json"
+
+
+def lock_file(name: str) -> Path:
+    return job_dir(name) / "state.lock"
+
+
+def reserve_file(name: str) -> Path:
+    return job_dir(name) / ".final-state-reserve"
+
+
+def prompt_file(name: str) -> Path:
+    return job_dir(name) / "completion.prompt"
+
+
+def delivery_lock_file(name: str) -> Path:
+    return job_dir(name) / "delivery.lock"
+
+
+def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    body = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+        raise
+
+
+@contextlib.contextmanager
+def job_lock(name: str, *, nonblocking: bool = False) -> Iterator[None]:
+    directory = job_dir(name)
+    ensure_private_dir(directory)
+    fd = os.open(lock_file(name), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+        fcntl.flock(fd, flags)
+        yield
+    finally:
+        os.close(fd)
+
+
+def read_job(name: str) -> dict[str, Any]:
+    path = state_file(name)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise JobError(f"unknown job: {name}") from exc
+    if len(raw.encode("utf-8")) > 256 * 1024:
+        raise JobError(f"job state is unexpectedly large: {path}")
+    record = json.loads(raw)
+    if record.get("schema_version") != SCHEMA_VERSION or record.get("name") != name:
+        raise JobError(f"invalid job state: {path}")
+    return record
+
+
+def update_job(
+    name: str, change: Callable[[dict[str, Any]], dict[str, Any]]
+) -> dict[str, Any]:
+    with job_lock(name):
+        current = read_job(name)
+        updated = change(current)
+        updated["updated_at"] = now_iso()
+        atomic_write_json(state_file(name), updated)
+        return updated
+
+
+def create_reserve(name: str, size: int = 64 * 1024) -> None:
+    path = reserve_file(name)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        block = b"\0" * 4096
+        remaining = size
+        while remaining:
+            written = os.write(fd, block[: min(len(block), remaining)])
+            remaining -= written
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def release_reserve(name: str) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        reserve_file(name).unlink()
+
+
+def linux_proc_info(pid: int) -> dict[str, Any]:
+    stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    close = stat_line.rfind(")")
+    if close < 0:
+        raise JobError(f"invalid /proc stat for pid {pid}")
+    fields = stat_line[close + 2 :].split()
+    try:
+        cmdline = (
+            Path(f"/proc/{pid}/cmdline")
+            .read_bytes()
+            .replace(b"\0", b" ")
+            .decode("utf-8", "replace")
+        )
+    except OSError:
+        cmdline = ""
+    return {
+        "pid": pid,
+        "ppid": int(fields[1]),
+        "start": fields[19],
+        "exe": os.path.realpath(f"/proc/{pid}/exe"),
+        "cmdline": cmdline,
+    }
+
+
+def portable_proc_info(pid: int) -> dict[str, Any]:
+    result = subprocess.run(
+        ["ps", "-o", "ppid=", "-o", "lstart=", "-o", "comm=", "-p", str(pid)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    line = result.stdout.strip()
+    match = re.match(r"^(\d+)\s+(.{24})\s+(.+)$", line)
+    if not match:
+        raise JobError(f"unable to parse process identity for pid {pid}")
+    return {
+        "pid": pid,
+        "ppid": int(match.group(1)),
+        "start": match.group(2),
+        "exe": match.group(3),
+    }
+
+
+def process_info(pid: int) -> dict[str, Any]:
+    if sys.platform.startswith("linux"):
+        return linux_proc_info(pid)
+    return portable_proc_info(pid)
+
+
+def process_identity(pid: int) -> dict[str, Any]:
+    info = process_info(pid)
+    return {"pid": pid, "start": info["start"], "exe": info["exe"]}
+
+
+def identity_alive(identity: dict[str, Any] | None) -> bool:
+    if not identity:
+        return False
+    try:
+        actual = process_identity(int(identity["pid"]))
+    except (OSError, ValueError, KeyError, JobError, subprocess.SubprocessError):
+        return False
+    return actual == identity
+
+
+def find_codex_ancestor(start_pid: int) -> dict[str, Any] | None:
+    override = os.environ.get("CODEX_LONG_JOBS_TEST_CODEX_PID")
+    if override:
+        return process_identity(int(override))
+    current = start_pid
+    visited: set[int] = set()
+    while current >= 1 and current not in visited:
+        visited.add(current)
+        try:
+            info = process_info(current)
+        except (OSError, JobError, subprocess.SubprocessError):
+            return None
+        executable = Path(str(info["exe"])).name.removesuffix(" (deleted)")
+        if executable == "codex":
+            return {"pid": current, "start": info["start"], "exe": info["exe"]}
+        current = int(info["ppid"])
+        if current <= 0:
+            break
+    return None
+
+
+def running_under_codex_sandbox(start_pid: int | None = None) -> bool:
+    """Detect the local Codex process sandbox that reaps detached descendants."""
+    if os.environ.get("CODEX_LONG_JOBS_ALLOW_SANDBOX") == "1":
+        return False
+    current = start_pid or os.getppid()
+    visited: set[int] = set()
+    while current >= 1 and current not in visited:
+        visited.add(current)
+        try:
+            info = process_info(current)
+        except (OSError, JobError, subprocess.SubprocessError):
+            return False
+        command_name = Path(str(info["exe"])).name
+        cmdline = str(info.get("cmdline", ""))
+        if command_name == "codex-linux-sandbox" or "--sandbox-policy-cwd" in cmdline:
+            return True
+        current = int(info["ppid"])
+        if current <= 0:
+            break
+    return False
+
+
+def is_descendant(child: int, ancestor: int) -> bool:
+    current = child
+    visited: set[int] = set()
+    while current > 1 and current not in visited:
+        if current == ancestor:
+            return True
+        visited.add(current)
+        try:
+            current = int(process_info(current)["ppid"])
+        except (OSError, JobError, subprocess.SubprocessError):
+            return False
+    return False
+
+
+def find_codex_in_pane(pane_pid: int, pane_tty: str) -> dict[str, Any] | None:
+    """Find the unique Codex process attached to a tmux pane.
+
+    Scoped host execution may no longer be a descendant of the TUI process, so
+    ancestry from the launcher is insufficient.  TTY plus pane ancestry keeps
+    this fallback narrow.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    matches: list[dict[str, Any]] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            identity = process_identity(pid)
+            executable = Path(str(identity["exe"])).name.removesuffix(" (deleted)")
+            if executable != "codex":
+                continue
+            if os.path.realpath(f"/proc/{pid}/fd/0") != pane_tty:
+                continue
+            if is_descendant(pid, pane_pid):
+                matches.append(identity)
+        except (OSError, JobError, subprocess.SubprocessError):
+            continue
+    return matches[0] if len(matches) == 1 else None
+
+
+def tmux_binary() -> str:
+    return os.environ.get("CODEX_LONG_JOBS_TMUX_BIN", "tmux")
+
+
+def tmux_call(
+    socket: str, arguments: list[str], *, check: bool = True
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [tmux_binary(), "-S", socket, *arguments],
+        check=check,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+
+def capture_endpoint() -> tuple[dict[str, Any] | None, str]:
+    thread_id = os.environ.get("CODEX_THREAD_ID", "")
+    tmux_env = os.environ.get("TMUX", "")
+    pane_id = os.environ.get("TMUX_PANE", "")
+    if not thread_id or not THREAD_RE.fullmatch(thread_id):
+        return None, "thread-id-unavailable"
+    if not tmux_env or not pane_id:
+        return None, "not-running-in-tmux"
+    socket = tmux_env.split(",", 1)[0]
+    try:
+        server_pid = int(
+            tmux_call(socket, ["display-message", "-p", "#{pid}"]).stdout.strip()
+        )
+        pane_meta = tmux_call(
+            socket,
+            [
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{pane_id}|#{pane_pid}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}",
+            ],
+        ).stdout.rstrip("\n")
+        checked_id, pane_pid_raw, pane_tty, pane_command, pane_cwd = pane_meta.split(
+            "|", 4
+        )
+        if checked_id != pane_id:
+            return None, "pane-id-mismatch"
+        pane_pid = int(pane_pid_raw)
+        pane_identity = process_identity(pane_pid)
+        codex_identity = find_codex_ancestor(os.getppid()) or find_codex_in_pane(
+            pane_pid, pane_tty
+        )
+        if not codex_identity:
+            return None, "codex-ancestor-unavailable"
+        if not is_descendant(int(codex_identity["pid"]), pane_pid):
+            return None, "codex-pane-ancestry-mismatch"
+    except (OSError, ValueError, JobError, subprocess.SubprocessError) as exc:
+        return None, f"tmux-capture-failed:{type(exc).__name__}"
+    return {
+        "thread_id": thread_id,
+        "tmux_socket": socket,
+        "tmux_server_pid": server_pid,
+        "pane_id": pane_id,
+        "pane_pid": pane_pid,
+        "pane_identity": pane_identity,
+        "pane_tty": pane_tty,
+        "pane_command": pane_command,
+        "pane_cwd": pane_cwd,
+        "codex_identity": codex_identity,
+        "bound_at": now_iso(),
+    }, "validated-origin-tui"
+
+
+def validate_endpoint(endpoint: dict[str, Any], owner_thread: str) -> tuple[bool, str]:
+    if endpoint.get("thread_id") != owner_thread:
+        return False, "thread-id-mismatch"
+    socket = str(endpoint.get("tmux_socket", ""))
+    pane_id = str(endpoint.get("pane_id", ""))
+    try:
+        server_pid = int(
+            tmux_call(socket, ["display-message", "-p", "#{pid}"]).stdout.strip()
+        )
+        if server_pid != int(endpoint["tmux_server_pid"]):
+            return False, "tmux-server-restarted"
+        meta = tmux_call(
+            socket,
+            [
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{pane_id}|#{pane_pid}|#{pane_tty}",
+            ],
+        ).stdout.strip()
+        expected = f"{pane_id}|{endpoint['pane_pid']}|{endpoint['pane_tty']}"
+        if meta != expected:
+            return False, "pane-identity-mismatch"
+        if not identity_alive(endpoint.get("pane_identity")):
+            return False, "pane-process-changed"
+        codex_identity = endpoint.get("codex_identity")
+        if not identity_alive(codex_identity):
+            return False, "codex-process-changed"
+        if not is_descendant(int(codex_identity["pid"]), int(endpoint["pane_pid"])):
+            return False, "codex-pane-ancestry-mismatch"
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return False, "endpoint-unavailable"
+    return True, "validated"
+
+
+def tmux_capture(endpoint: dict[str, Any], *, escaped: bool) -> str:
+    args = ["capture-pane", "-p", "-S", "-80"]
+    if escaped:
+        args.append("-e")
+    args.extend(["-t", str(endpoint["pane_id"])])
+    return tmux_call(str(endpoint["tmux_socket"]), args).stdout
+
+
+def composer_is_empty(escaped_screen: str) -> bool:
+    composer = ""
+    for line in escaped_screen.splitlines():
+        if "›" in line:
+            composer = line
+    return bool(composer and "\x1b[2m" in composer)
+
+
+def screen_is_busy(plain_screen: str) -> bool:
+    lowered = plain_screen.lower()
+    return any(marker in lowered for marker in BUSY_MARKERS)
+
+
+def set_delivery(name: str, status: str, reason: str, **extra: Any) -> dict[str, Any]:
+    def change(record: dict[str, Any]) -> dict[str, Any]:
+        delivery = dict(record.get("delivery", {}))
+        delivery.update({"status": status, "reason": reason, **extra})
+        record["delivery"] = delivery
+        return record
+
+    return update_job(name, change)
+
+
+def completion_prompt(record: dict[str, Any]) -> str:
+    name = record["name"]
+    state = state_file(name)
+    log = record["log"]
+    token = record["delivery"]["token"]
+    if record["status"] == "succeeded":
+        lead = f"Background job '{name}' completed successfully."
+    else:
+        lead = f"Background job '{name}' failed."
+    return (
+        f"{lead} Inspect {state} and {log}, verify the actual artifacts, then continue only work "
+        f"already authorized by the conversation or report the concrete blocker. {token}"
+    )
+
+
+def write_private_text(path: Path, text: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def try_tui_submission(
+    name: str, record: dict[str, Any], endpoint: dict[str, Any]
+) -> tuple[bool, str]:
+    prompt = completion_prompt(record)
+    token = record["delivery"]["token"]
+    write_private_text(prompt_file(name), prompt)
+    buffer_name = f"codex-long-jobs-{name}"
+    socket = str(endpoint["tmux_socket"])
+    pane = str(endpoint["pane_id"])
+    try:
+        tmux_call(socket, ["load-buffer", "-b", buffer_name, str(prompt_file(name))])
+        tmux_call(socket, ["paste-buffer", "-p", "-d", "-b", buffer_name, "-t", pane])
+    except subprocess.SubprocessError:
+        return False, "paste-failed"
+
+    visible = False
+    for _ in range(20):
+        try:
+            if token in tmux_capture(endpoint, escaped=False):
+                visible = True
+                break
+        except subprocess.SubprocessError:
+            return False, "pane-lost-after-paste"
+        time.sleep(0.05)
+    if not visible:
+        return False, "prompt-not-visible-after-paste"
+
+    # Retry Enter only while the exact freshly pasted token is still visible
+    # and the TUI has not become busy.  This addresses a missed key event
+    # without creating a second prompt or relying on Codex's queue shortcut.
+    for attempt in range(1, 5):
+        sent = tmux_call(socket, ["send-keys", "-t", pane, "Enter"], check=False)
+        time.sleep(0.25 * attempt)
+        try:
+            plain = tmux_capture(endpoint, escaped=False)
+            escaped = tmux_capture(endpoint, escaped=True)
+        except subprocess.SubprocessError:
+            return False, "pane-lost-after-submit"
+        if composer_is_empty(escaped) or screen_is_busy(plain):
+            return True, f"submitted-after-{attempt}-enter-attempts"
+        if token not in plain:
+            return False, "submission-uncertain-token-disappeared"
+        if sent.returncode != 0 and attempt == 4:
+            return False, "enter-key-failed"
+    return False, "composer-did-not-acknowledge-submit"
+
+
+def deliver_tui(name: str) -> None:
+    directory = job_dir(name)
+    ensure_private_dir(directory)
+    fd = os.open(delivery_lock_file(name), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        record = read_job(name)
+        if record["status"] not in TERMINAL_STATUSES:
+            return
+        if record.get("delivery", {}).get("status") in DELIVERY_DONE:
+            return
+        wait_seconds = int(record.get("delivery", {}).get("wait_seconds", 86400))
+        poll_seconds = float(
+            os.environ.get("CODEX_LONG_JOBS_DELIVERY_POLL_SECONDS", "2")
+        )
+        deadline = time.monotonic() + max(1, wait_seconds)
+        last_reason = ""
+        while time.monotonic() < deadline:
+            record = read_job(name)
+            endpoint = record.get("endpoint")
+            owner_thread = str(record.get("owner_thread_id", ""))
+            if not endpoint:
+                reason = "waiting-for-session-rebind"
+            else:
+                valid, reason = validate_endpoint(endpoint, owner_thread)
+                if valid:
+                    try:
+                        plain = tmux_capture(endpoint, escaped=False)
+                        escaped = tmux_capture(endpoint, escaped=True)
+                    except subprocess.SubprocessError:
+                        valid, reason = False, "pane-capture-failed"
+                    if valid and screen_is_busy(plain):
+                        reason = "owning-tui-busy"
+                    elif valid and not composer_is_empty(escaped):
+                        reason = "composer-not-empty"
+                    elif valid:
+                        set_delivery(name, "delivering", "safe-idle-boundary")
+                        delivered, submit_reason = try_tui_submission(
+                            name, record, endpoint
+                        )
+                        if delivered:
+                            set_delivery(
+                                name,
+                                "delivered",
+                                submit_reason,
+                                delivered_at=now_iso(),
+                                pane_id=endpoint["pane_id"],
+                            )
+                            return
+                        set_delivery(name, "pending", submit_reason)
+                        # A prompt may now be present.  Do not paste a duplicate.
+                        if submit_reason not in {
+                            "enter-key-failed",
+                            "composer-did-not-acknowledge-submit",
+                        }:
+                            return
+                        time.sleep(min(2.0, poll_seconds))
+                        continue
+            if reason != last_reason:
+                set_delivery(name, "pending", reason)
+                last_reason = reason
+            time.sleep(max(0.1, poll_seconds))
+        set_delivery(name, "pending", "delivery-wait-expired-rebind-or-retry-required")
+    finally:
+        os.close(fd)
+
+
+def launch_desktop_notification(record: dict[str, Any]) -> None:
+    if not record.get("notify_user", True):
+        return
+    message = f"{record['name']} finished {record['status']}; exit code {record.get('exit_code', 'unknown')}."
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        command = [
+            "osascript",
+            "-e",
+            "on run argv",
+            "-e",
+            'display notification (item 1 of argv) with title "Codex Long Jobs"',
+            "-e",
+            "end run",
+            "--",
+            message,
+        ]
+    elif sys.platform.startswith("linux") and shutil.which("notify-send"):
+        command = [
+            "notify-send",
+            "--app-name",
+            "Codex Long Jobs",
+            "--",
+            "Background job finished",
+            message,
+        ]
+    else:
+        return
+    with contextlib.suppress(OSError):
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
+def launch_headless(record: dict[str, Any]) -> None:
+    name = record["name"]
+    thread = record.get("owner_thread_id")
+    if not thread:
+        set_delivery(name, "disabled", "headless-thread-id-unavailable")
+        return
+    codex_bin = os.environ.get("CODEX_LONG_JOBS_CODEX_BIN", "codex")
+    output = job_dir(name) / "headless-continuation.log"
+    try:
+        with open(output, "ab", buffering=0) as handle:
+            child = subprocess.Popen(
+                [codex_bin, "exec", "resume", thread, completion_prompt(record)],
+                cwd=record["cwd"],
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except OSError as exc:
+        set_delivery(name, "pending", f"headless-dispatch-failed:{exc.errno}")
+        return
+    set_delivery(
+        name,
+        "headless-dispatched",
+        "explicit-headless-mode",
+        continuation_pid=child.pid,
+        continuation_log=str(output),
+    )
+
+
+def finalize_delivery(name: str) -> None:
+    record = read_job(name)
+    launch_desktop_notification(record)
+    mode = record.get("delivery", {}).get("mode")
+    if mode == "event-only":
+        set_delivery(
+            name, "disabled", record["delivery"].get("selection_reason", "event-only")
+        )
+    elif mode == "headless":
+        launch_headless(record)
+    else:
+        deliver_tui(name)
+
+
+def worker_main(name: str) -> int:
+    name = validate_name(name)
+    worker_id = process_identity(os.getpid())
+
+    def starting(record: dict[str, Any]) -> dict[str, Any]:
+        if record["status"] != "queued":
+            raise JobError(f"job is not queued: {name}")
+        record.update(
+            status="starting", started_at=now_iso(), worker_identity=worker_id
+        )
+        return record
+
+    record = update_job(name, starting)
+    command = list(record["command"])
+    log_path = Path(record["log"])
+    marker = (
+        re.compile(record["success_pattern"]) if record.get("success_pattern") else None
+    )
+    marker_seen = marker is None
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    marker_buffer = ""
+    log_error: str | None = None
+    test_fail_after = int(
+        os.environ.get("CODEX_LONG_JOBS_TEST_LOG_FAIL_AFTER_BYTES", "-1")
+    )
+    logged_bytes = 0
+    child: subprocess.Popen[bytes] | None = None
+    return_code: int | None = None
+
+    try:
+        child = subprocess.Popen(
+            command,
+            cwd=record["cwd"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+        child_id = process_identity(child.pid)
+
+        def running(current: dict[str, Any]) -> dict[str, Any]:
+            current.update(
+                status="running", child_identity=child_id, child_pid=child.pid
+            )
+            return current
+
+        update_job(name, running)
+        assert child.stdout is not None
+        with open(log_path, "ab", buffering=0) as log_handle:
+            while True:
+                chunk = child.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                text = decoder.decode(chunk)
+                if marker and not marker_seen:
+                    marker_buffer = (marker_buffer + text)[-128 * 1024 :]
+                    marker_seen = marker.search(marker_buffer) is not None
+                if log_error is None:
+                    try:
+                        if (
+                            test_fail_after >= 0
+                            and logged_bytes + len(chunk) > test_fail_after
+                        ):
+                            raise OSError(errno.ENOSPC, "simulated log filesystem full")
+                        log_handle.write(chunk)
+                        logged_bytes += len(chunk)
+                    except OSError as exc:
+                        log_error = f"{exc.__class__.__name__}: {exc}"
+            tail = decoder.decode(b"", final=True)
+            if marker and not marker_seen and tail:
+                marker_seen = (
+                    marker.search((marker_buffer + tail)[-128 * 1024 :]) is not None
+                )
+        return_code = child.wait()
+    except BaseException as exc:
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        log_error = log_error or f"worker error: {exc.__class__.__name__}: {exc}"
+        if child is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGTERM)
+            with contextlib.suppress(BaseException):
+                child.wait(timeout=5)
+            return_code = child.returncode
+
+    release_reserve(name)
+    signal_name = None
+    exit_code = return_code
+    if return_code is not None and return_code < 0:
+        signal_name = signal.Signals(-return_code).name
+        exit_code = None
+    succeeded = return_code == 0 and log_error is None and marker_seen
+    reasons: list[str] = []
+    if return_code != 0:
+        reasons.append(f"command-exit={return_code}")
+    if log_error:
+        reasons.append(f"log-write-failed={log_error}")
+    if not marker_seen:
+        reasons.append("success-marker-missing")
+
+    def terminal(current: dict[str, Any]) -> dict[str, Any]:
+        current.update(
+            status="succeeded" if succeeded else "failed",
+            completed_at=now_iso(),
+            exit_code=exit_code,
+            signal=signal_name,
+            marker_seen=marker_seen,
+            log_error=log_error,
+            failure_reasons=reasons,
+            child_pid=None,
+            child_identity=None,
+        )
+        return current
+
+    update_job(name, terminal)
+    finalize_delivery(name)
+    return 0 if succeeded else 1
+
+
+def choose_log_path(name: str, requested: str | None) -> Path:
+    if requested:
+        path = Path(requested).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path.resolve()
+    return (state_root() / "logs" / f"{name}.log").resolve()
+
+
+def select_delivery(
+    requested: str, thread_id: str, endpoint: dict[str, Any] | None, reason: str
+) -> tuple[str, str]:
+    if requested == "auto":
+        if thread_id:
+            return "tui", "auto-tui" if endpoint else f"auto-pending-rebind:{reason}"
+        return "event-only", "auto-fallback-thread-id-unavailable"
+    if requested in {"tui", "headless"} and not thread_id:
+        return "event-only", f"{requested}-fallback-thread-id-unavailable"
+    return requested, f"requested-{requested}"
+
+
+def viewer_label() -> str:
+    return os.environ.get("CODEX_LONG_JOBS_TMUX_LABEL", "codex-long-jobs")
+
+
+def viewer_session(name: str) -> str:
+    return f"clj-{name}"[:80]
+
+
+def start_viewer(name: str, log_path: Path) -> tuple[bool, str]:
+    if not shutil.which(tmux_binary()) or not shutil.which("tail"):
+        return False, "tmux-or-tail-unavailable"
+    label = viewer_label()
+    session = viewer_session(name)
+    check = subprocess.run(
+        [tmux_binary(), "-L", label, "has-session", "-t", session],
+        check=False,
+        capture_output=True,
+    )
+    if check.returncode == 0:
+        return True, "viewer-already-running"
+    result = subprocess.run(
+        [
+            tmux_binary(),
+            "-L",
+            label,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "--",
+            shutil.which("tail") or "tail",
+            "-n",
+            "200",
+            "-F",
+            str(log_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return False, f"viewer-start-failed:{result.stderr.strip()}"
+    return True, "viewer-started"
+
+
+def spawn_detached(arguments: list[str], *, cwd: str, log_path: Path) -> int:
+    with open(log_path, "ab", buffering=0) as handle:
+        child = subprocess.Popen(
+            arguments,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    return child.pid
+
+
+def command_start(args: argparse.Namespace) -> int:
+    if running_under_codex_sandbox():
+        raise JobError(
+            "the active Codex tool sandbox will reap detached descendants when this call ends; "
+            "re-run this exact start command with scoped host execution"
+        )
+    ensure_state_root()
+    name = validate_name(args.name)
+    command = list(args.command)
+    if command and command[0] == "--":
+        command.pop(0)
+    if not command:
+        raise JobError("a command is required after --")
+    directory = job_dir(name)
+    if directory.exists():
+        raise JobError(f"job already exists: {name}")
+    ensure_private_dir(directory)
+    log_path = choose_log_path(name, args.log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_TRUNC if args.overwrite_log else os.O_EXCL
+    fd = os.open(log_path, flags, 0o600)
+    os.close(fd)
+    log_path.chmod(0o600)
+    endpoint, endpoint_reason = capture_endpoint()
+    thread_id = os.environ.get("CODEX_THREAD_ID", "")
+    if not THREAD_RE.fullmatch(thread_id):
+        thread_id = ""
+    mode, selection_reason = select_delivery(
+        args.delivery, thread_id, endpoint, endpoint_reason
+    )
+    token = f"[codex-long-jobs:{name}:{secrets.token_hex(6)}]"
+    record: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "runtime_version": VERSION,
+        "name": name,
+        "status": "queued",
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "cwd": str(Path.cwd()),
+        "command": command,
+        "log": str(log_path),
+        "success_pattern": args.success_pattern,
+        "owner_thread_id": thread_id or None,
+        "endpoint": endpoint,
+        "endpoint_capture_reason": endpoint_reason,
+        "notify_user": not args.no_desktop_notify,
+        "delivery": {
+            "mode": mode,
+            "status": "pending" if mode != "event-only" else "disabled",
+            "selection_reason": selection_reason,
+            "reason": selection_reason,
+            "token": token,
+            "wait_seconds": args.delivery_wait_seconds,
+        },
+    }
+    create_reserve(name)
+    atomic_write_json(state_file(name), record)
+    worker_pid = spawn_detached(
+        [sys.executable, str(Path(__file__).resolve()), "_worker", "--name", name],
+        cwd=record["cwd"],
+        log_path=log_path,
+    )
+
+    def launched(current: dict[str, Any]) -> dict[str, Any]:
+        current["worker_spawn_pid"] = worker_pid
+        return current
+
+    update_job(name, launched)
+    viewer_mode = args.viewer
+    if viewer_mode == "auto":
+        viewer_mode = "tmux" if os.environ.get("TMUX") else "none"
+    viewer_ok, viewer_reason = (False, "not-requested")
+    if viewer_mode == "tmux":
+        viewer_ok, viewer_reason = start_viewer(name, log_path)
+    print(f"job={name}")
+    print(f"worker_pid={worker_pid}")
+    print(f"log={log_path}")
+    print(f"state={state_file(name)}")
+    print(f"delivery_mode={mode}")
+    print(f"delivery_reason={selection_reason}")
+    print(f"viewer={viewer_reason}")
+    if viewer_ok:
+        print(
+            f"viewer_attach=TMUX= tmux -L {viewer_label()} attach -t {viewer_session(name)}"
+        )
+    return 0
+
+
+def render_status(record: dict[str, Any]) -> str:
+    delivery = record.get("delivery", {})
+    rows = [
+        f"job={record['name']}",
+        f"status={record['status']}",
+        f"exit_code={record.get('exit_code', 'pending')}",
+        f"log={record['log']}",
+        f"state={state_file(record['name'])}",
+        f"delivery_mode={delivery.get('mode', 'unknown')}",
+        f"delivery_status={delivery.get('status', 'unknown')}",
+        f"delivery_reason={delivery.get('reason', 'unknown')}",
+    ]
+    if record.get("failure_reasons"):
+        rows.append("failure_reasons=" + ";".join(record["failure_reasons"]))
+    return "\n".join(rows)
+
+
+def command_status(args: argparse.Namespace) -> int:
+    if args.name:
+        records = [read_job(validate_name(args.name))]
+    else:
+        records = []
+        jobs_directory = state_root() / "jobs"
+        if not jobs_directory.exists():
+            print("[]" if args.json else "")
+            return 0
+        for path in sorted(jobs_directory.glob("*/state.json")):
+            with contextlib.suppress(JobError, json.JSONDecodeError, OSError):
+                records.append(read_job(path.parent.name))
+    if args.json:
+        print(
+            json.dumps(
+                records[0] if args.name and records else records,
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print("\n\n".join(render_status(record) for record in records))
+    return 0
+
+
+def spawn_delivery(name: str) -> int:
+    log_path = job_dir(name) / "delivery-worker.log"
+    return spawn_detached(
+        [sys.executable, str(Path(__file__).resolve()), "_deliver", "--name", name],
+        cwd=read_job(name)["cwd"],
+        log_path=log_path,
+    )
+
+
+def command_rebind(args: argparse.Namespace) -> int:
+    if running_under_codex_sandbox():
+        raise JobError(
+            "rebind must use scoped host execution so its delivery worker can survive this call"
+        )
+    ensure_state_root()
+    endpoint, reason = capture_endpoint()
+    if not endpoint:
+        raise JobError(f"cannot bind the current Codex TUI: {reason}")
+    thread_id = endpoint["thread_id"]
+    names: list[str]
+    if args.all:
+        names = [
+            path.parent.name
+            for path in sorted((state_root() / "jobs").glob("*/state.json"))
+        ]
+    elif args.name:
+        names = [validate_name(args.name)]
+    else:
+        raise JobError("use --name NAME or --all")
+    rebound = 0
+    for name in names:
+        record = read_job(name)
+        if record.get("owner_thread_id") != thread_id:
+            if args.name:
+                raise JobError(
+                    "refusing to bind a job owned by a different Codex thread"
+                )
+            continue
+
+        def bind(current: dict[str, Any]) -> dict[str, Any]:
+            current["endpoint"] = endpoint
+            current["endpoint_capture_reason"] = "explicit-rebind"
+            if (
+                current.get("delivery", {}).get("mode") == "tui"
+                and current["delivery"].get("status") != "delivered"
+            ):
+                current["delivery"]["status"] = "pending"
+                current["delivery"]["reason"] = "explicit-rebind"
+            return current
+
+        updated = update_job(name, bind)
+        rebound += 1
+        if (
+            updated["status"] in TERMINAL_STATUSES
+            and updated.get("delivery", {}).get("mode") == "tui"
+        ):
+            spawn_delivery(name)
+        print(f"rebound={name}")
+    print(f"rebound_count={rebound}")
+    return 0
+
+
+def command_retry_delivery(args: argparse.Namespace) -> int:
+    if running_under_codex_sandbox():
+        raise JobError(
+            "delivery retry must use scoped host execution so it can survive this call"
+        )
+    name = validate_name(args.name)
+    record = read_job(name)
+    if record["status"] not in TERMINAL_STATUSES:
+        raise JobError("job is not terminal")
+    if record.get("delivery", {}).get("status") == "delivered":
+        print("delivery already completed")
+        return 0
+    pid = spawn_delivery(name)
+    print(f"delivery_worker_pid={pid}")
+    return 0
+
+
+def command_view(args: argparse.Namespace) -> int:
+    record = read_job(validate_name(args.name))
+    ok, reason = start_viewer(record["name"], Path(record["log"]))
+    if not ok:
+        raise JobError(reason)
+    print(f"viewer={reason}")
+    print(
+        f"viewer_attach=TMUX= tmux -L {viewer_label()} attach -t {viewer_session(record['name'])}"
+    )
+    return 0
+
+
+def command_tail(args: argparse.Namespace) -> int:
+    record = read_job(validate_name(args.name))
+    tail = shutil.which("tail")
+    if not tail:
+        raise JobError("tail is unavailable")
+    os.execv(tail, [tail, "-n", str(args.lines), "-F", record["log"]])
+    return 0
+
+
+def command_doctor(_: argparse.Namespace) -> int:
+    print(f"version={VERSION}")
+    print(f"python={sys.version.split()[0]}")
+    print(f"platform={sys.platform}")
+    print(f"state_root={state_root()}")
+    print(f"tmux={shutil.which(tmux_binary()) or 'unavailable'}")
+    print(f"tail={shutil.which('tail') or 'unavailable'}")
+    endpoint, reason = capture_endpoint()
+    print(f"tui_endpoint={reason}")
+    if endpoint:
+        print(f"thread_id={endpoint['thread_id']}")
+        print(f"pane_id={endpoint['pane_id']}")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="codex-long-jobs", description=__doc__)
+    root.add_argument("--version", action="version", version=VERSION)
+    sub = root.add_subparsers(dest="subcommand", required=True)
+
+    start = sub.add_parser("start", help="start a durable detached job")
+    start.add_argument("--name", required=True)
+    start.add_argument("--log")
+    start.add_argument("--success-pattern")
+    start.add_argument("--overwrite-log", action="store_true")
+    start.add_argument(
+        "--delivery", choices=["auto", "tui", "headless", "event-only"], default="auto"
+    )
+    start.add_argument("--viewer", choices=["auto", "tmux", "none"], default="auto")
+    start.add_argument("--delivery-wait-seconds", type=int, default=86400)
+    start.add_argument("--no-desktop-notify", action="store_true")
+    start.add_argument("command", nargs=argparse.REMAINDER)
+    start.set_defaults(func=command_start)
+
+    status = sub.add_parser("status", help="show durable job state")
+    status.add_argument("--name")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=command_status)
+
+    rebind = sub.add_parser(
+        "rebind", help="bind pending jobs to the current resumed Codex TUI"
+    )
+    group = rebind.add_mutually_exclusive_group(required=True)
+    group.add_argument("--name")
+    group.add_argument("--all", action="store_true")
+    rebind.set_defaults(func=command_rebind)
+
+    retry = sub.add_parser(
+        "retry-delivery", help="retry a terminal job's pending TUI delivery"
+    )
+    retry.add_argument("--name", required=True)
+    retry.set_defaults(func=command_retry_delivery)
+
+    view = sub.add_parser(
+        "view", help="create or restore the disposable tmux log viewer"
+    )
+    view.add_argument("--name", required=True)
+    view.set_defaults(func=command_view)
+
+    tail = sub.add_parser("tail", help="follow a job log in the current terminal")
+    tail.add_argument("--name", required=True)
+    tail.add_argument("--lines", type=int, default=200)
+    tail.set_defaults(func=command_tail)
+
+    doctor = sub.add_parser(
+        "doctor", help="inspect runtime and TUI binding prerequisites"
+    )
+    doctor.set_defaults(func=command_doctor)
+
+    worker = sub.add_parser("_worker")
+    worker.add_argument("--name", required=True)
+    worker.set_defaults(func=lambda args: worker_main(args.name))
+
+    deliver = sub.add_parser("_deliver")
+    deliver.add_argument("--name", required=True)
+    deliver.set_defaults(func=lambda args: (deliver_tui(args.name), 0)[1])
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        args = parser().parse_args(argv)
+        return int(args.func(args))
+    except JobError as exc:
+        print(f"codex-long-jobs: {exc}", file=sys.stderr)
+        return 1
+    except PermissionError as exc:
+        print(
+            f"codex-long-jobs: permission denied for {exc.filename or state_root()}; "
+            "re-run the identical command with scoped permission for the configured state directory",
+            file=sys.stderr,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
