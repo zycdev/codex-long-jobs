@@ -6,7 +6,7 @@ Event-driven background jobs for OpenAI Codex CLI: durable execution,
 persistent logs, abnormal-exit detection, and automatic wake-up of the owning
 tmux TUI, without spending model turns polling for progress.
 
-> Status: `v0.1.0` beta. Linux is the primary tested platform.
+> Status: `v0.2.0` beta. Linux is the primary tested platform.
 
 ## Why this skill exists
 
@@ -19,17 +19,17 @@ happened.
 Codex Long Jobs separates three responsibilities:
 
 ```text
-Codex turn ──starts──> detached worker ──waits for──> command
-    ▲                       │                           │
-    │                       ├── persistent state/logs <─┘
-    │                       │
-    └── safe idle wake <────┴── completion delivery
+Codex turn -> detached supervisor -> worker -> command
+    ^                 |            |          |
+    |                 |            + state and log
+    |                 + detects worker failure
+    + safe idle wake after terminal state
 
-tmux viewer ──reads the log only; it never owns the command
+tmux viewer -> reads the log only; it never owns the command
 ```
 
-The worker waits locally for process exit. Codex is invoked again only when a
-terminal event needs attention.
+The worker waits locally for command exit, while the supervisor waits for the
+worker. Codex is invoked again only when a terminal event needs attention.
 
 ## Advantages
 
@@ -42,12 +42,16 @@ terminal event needs attention.
 - **Success and failure use the same wake path.** Nonzero exits, signals,
   missing success markers, and log write failures all produce durable terminal
   state and trigger delivery.
+- **Worker failure is supervised.** If the worker is killed or exits before
+  writing terminal state, an independent detached supervisor stops the orphaned
+  command group, records failure, and invokes the same delivery path.
 - **Disk-full failures are explicit.** Log ENOSPC overrides a misleading command
   exit code zero, and a small reserved state file is released before final
   metadata is written.
 - **Busy TUI delivery is durable.** Completion waits for an idle turn and empty
   composer before pasting. It does not rely on a fragile `Tab` queue. A missed
-  first `Enter` retries the key without pasting a duplicate prompt.
+  first `Enter` retries the key without pasting a duplicate prompt. A global
+  delivery lock serializes simultaneous completions from different jobs.
 - **Session restart recovery.** Resume the same Codex thread in any tmux pane
   and explicitly rebind pending jobs; thread identity prevents accidental
   delivery to another conversation.
@@ -102,9 +106,11 @@ Codex must run `start` with scoped host permission. Its normal tool sandbox
 reaps detached children when the tool call ends; the controller detects that
 condition and refuses to pretend the job detached successfully.
 
-The command prints the worker PID, log path, durable state path, delivery mode,
-and optional viewer attach command. After a one-time running-state check, let
-the Codex turn end. The worker initiates completion delivery.
+The command prints the supervisor PID, log path, durable state path, delivery
+mode, and optional viewer attach command. After a one-time running-state check,
+let the Codex turn end. The worker and supervisor handle completion locally.
+Success patterns use multiline regular-expression semantics, so anchors such as
+`^BUILD_COMPLETE$` match one complete log line after any earlier output.
 
 ## Commands
 
@@ -163,24 +169,29 @@ would ultimately be preferable to terminal injection.
   require compatibility updates.
 - Rebind is mandatory after the Codex process exits or the displayed thread is
   changed. Simply returning to the old pane is insufficient.
-- The worker survives tmux failure, not machine reboot or an uncatchable kill of
-  the worker itself. Use systemd, a cluster scheduler, or another service
-  manager when host-level restart recovery is required.
+- The supervisor and worker survive tmux failure, not machine reboot or an
+  uncatchable kill of the supervisor itself. Use systemd, a cluster scheduler,
+  or another service manager when host-level restart recovery is required.
 - Native Windows is not currently supported.
 
 See [references/operations.md](references/operations.md) for the full failure
-model and recovery rules.
+model and recovery rules. See [references/testing.md](references/testing.md)
+for the verified test matrix and remaining environmental boundaries.
 
 ## Development
 
 ```bash
 scripts/smoke_test.sh
+scripts/stress_test.sh 10
+scripts/coverage_test.sh
 python3 /path/to/skill-creator/scripts/quick_validate.py .
 ```
 
-The smoke suite covers successful and failed commands, simulated disk-full log
-writes, a disposable tmux viewer crash, busy-TUI deferral, missed-Enter retry,
-and explicit session rebind.
+The automated suite covers lifecycle, kernel and simulated write failures,
+signals, worker death, concurrent starts and deliveries, tmux viewer failure,
+busy-TUI deferral, missed-Enter retry, headless dispatch, notification safety,
+argument boundaries, path safety, and explicit session rebind. CI runs every
+supported Python minor version from 3.10 through 3.14.
 
 ## License
 

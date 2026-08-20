@@ -30,13 +30,16 @@ the sandbox.
 
 Choose a unique success marker emitted only after every required stage and
 artifact check succeeds. Omit `--success-pattern` only when exit code zero is a
-sufficient contract. Pass argv directly after `--`; use `bash -c` explicitly
-only when the requested workflow genuinely requires shell syntax.
+sufficient contract. Patterns use multiline regular-expression semantics, so
+`^MARKER$` matches one complete log line. Pass argv directly after `--`; use
+`bash -c` explicitly only when the requested workflow genuinely requires shell
+syntax.
 
-Report the printed job name, worker PID, log, state file, delivery mode, and
-viewer attach command. Verify the job reaches `running` once, then end the turn.
-Do not spend model turns polling. The local worker waits for process exit and
-initiates delivery itself.
+Report the printed job name, supervisor PID, log, state file, delivery mode,
+and viewer attach command. Verify the job reaches `running` once, then end the
+turn. Do not spend model turns polling. The local worker waits for process exit,
+and the detached supervisor converts unexpected worker exit into durable
+failure and delivery.
 
 ## Choose delivery behavior
 

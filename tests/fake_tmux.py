@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import sys
+import time
 from pathlib import Path
 
 root = Path(os.environ["FAKE_TMUX_STATE_DIR"])
@@ -22,6 +24,15 @@ def read(name: str, default: str = "") -> str:
 
 def write(name: str, value: str) -> None:
     (root / name).write_text(value, encoding="utf-8")
+
+
+def increment(name: str) -> int:
+    lock = root / f"{name}.lock"
+    with lock.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        value = int(read(name, "0")) + 1
+        write(name, str(value))
+        return value
 
 
 def screen(escaped: bool) -> str:
@@ -55,13 +66,12 @@ elif command == "capture-pane":
 elif command == "load-buffer":
     source = Path(arguments[-1])
     write("buffer", source.read_text(encoding="utf-8"))
+    time.sleep(float(read("load_delay", "0")))
 elif command == "paste-buffer":
-    count = int(read("paste_count", "0")) + 1
-    write("paste_count", str(count))
+    increment("paste_count")
     write("mode", "pasted")
 elif command == "send-keys":
-    count = int(read("enter_count", "0")) + 1
-    write("enter_count", str(count))
+    count = increment("enter_count")
     failures = int(read("fail_enter_count", "0"))
     if count <= failures:
         raise SystemExit(1)

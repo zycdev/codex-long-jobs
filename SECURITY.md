@@ -7,5 +7,7 @@ issue.
 
 The supported line is the latest tagged release. This project executes commands
 with the invoking user's authority, persists argv and local paths, and uses tmux
-input injection only after same-user process and pane identity checks. Review
-the source before installation and keep state directories private.
+input injection only after same-user process and pane identity checks. Evidence
+paths are escaped before prompt construction, and concurrent deliveries share a
+state-root lock. Review the source before installation and keep state
+directories private.

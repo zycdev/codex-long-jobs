@@ -14,12 +14,14 @@ import contextlib
 import datetime as dt
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,13 +30,14 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SCHEMA_VERSION = 1
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 THREAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,160}$")
 TERMINAL_STATUSES = {"succeeded", "failed"}
 DELIVERY_DONE = {"delivered", "disabled", "headless-dispatched"}
 BUSY_MARKERS = ("esc to interrupt", "ctrl+c to interrupt")
+MAX_MARKER_BUFFER_BYTES = 128 * 1024
 
 
 class JobError(RuntimeError):
@@ -100,6 +103,10 @@ def delivery_lock_file(name: str) -> Path:
     return job_dir(name) / "delivery.lock"
 
 
+def tui_delivery_lock_file() -> Path:
+    return state_root() / "tui-delivery.lock"
+
+
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
     body = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
     fd, temporary = tempfile.mkstemp(
@@ -112,6 +119,12 @@ def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temporary)
@@ -128,6 +141,25 @@ def job_lock(name: str, *, nonblocking: bool = False) -> Iterator[None]:
         fcntl.flock(fd, flags)
         yield
     finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def tui_delivery_lock() -> Iterator[bool]:
+    """Serialize delivery across jobs so two prompts cannot share a composer."""
+    ensure_private_dir(state_root())
+    fd = os.open(tui_delivery_lock_file(), os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            pass
+        yield acquired
+    finally:
+        if acquired:
+            fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
@@ -173,6 +205,78 @@ def create_reserve(name: str, size: int = 64 * 1024) -> None:
 def release_reserve(name: str) -> None:
     with contextlib.suppress(FileNotFoundError):
         reserve_file(name).unlink()
+
+
+def compile_success_pattern(pattern: str | None) -> re.Pattern[str] | None:
+    if pattern is None:
+        return None
+    try:
+        # Treat markers as log-line patterns. This keeps the documented
+        # ``^MARKER$`` form valid even when a command emitted earlier output.
+        return re.compile(pattern, re.MULTILINE)
+    except re.error as exc:
+        raise JobError(f"invalid success pattern: {exc}") from exc
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def return_code_signal(return_code: int | None) -> str | None:
+    if return_code is None or return_code >= 0:
+        return None
+    signum = -return_code
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"SIG{signum}"
+
+
+def write_log_chunk(handle: Any, chunk: bytes, written_total: int) -> int:
+    """Write a complete output chunk and surface partial-write failures."""
+    fail_after = int(os.environ.get("CODEX_LONG_JOBS_TEST_LOG_FAIL_AFTER_BYTES", "-1"))
+    max_write = int(os.environ.get("CODEX_LONG_JOBS_TEST_LOG_MAX_WRITE", "-1"))
+    view = memoryview(chunk)
+    offset = 0
+    while offset < len(view):
+        if fail_after >= 0 and written_total + offset >= fail_after:
+            raise OSError(errno.ENOSPC, "simulated log filesystem full")
+        limit = len(view) - offset
+        if fail_after >= 0:
+            limit = min(limit, fail_after - written_total - offset)
+        if max_write > 0:
+            limit = min(limit, max_write)
+        if limit <= 0:
+            raise OSError(errno.ENOSPC, "simulated log filesystem full")
+        written = handle.write(view[offset : offset + limit])
+        if written is None or written <= 0:
+            raise OSError(errno.EIO, "log write made no progress")
+        offset += written
+    return written_total + offset
+
+
+def open_log_for_append(path: Path, *, create: bool = False) -> Any:
+    """Open a private regular log without following a replaced symlink."""
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC
+    if create:
+        flags |= os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise JobError(f"log path is not a regular file: {path}")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise JobError(f"log file is not owned by the current user: {path}")
+        os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "ab", buffering=0)
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def linux_proc_info(pid: int) -> dict[str, Any]:
@@ -464,21 +568,26 @@ def set_delivery(name: str, status: str, reason: str, **extra: Any) -> dict[str,
 
 def completion_prompt(record: dict[str, Any]) -> str:
     name = record["name"]
-    state = state_file(name)
-    log = record["log"]
+    state = json.dumps(str(state_file(name)), ensure_ascii=True)
+    log = json.dumps(str(record["log"]), ensure_ascii=True)
     token = record["delivery"]["token"]
     if record["status"] == "succeeded":
         lead = f"Background job '{name}' completed successfully."
     else:
         lead = f"Background job '{name}' failed."
     return (
-        f"{lead} Inspect {state} and {log}, verify the actual artifacts, then continue only work "
+        f"{lead} Inspect state_path={state} and log_path={log}, verify the actual artifacts, then continue only work "
         f"already authorized by the conversation or report the concrete blocker. {token}"
     )
 
 
 def write_private_text(path: Path, text: str) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    except BaseException:
+        os.close(fd)
+        raise
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
         handle.flush()
@@ -561,38 +670,46 @@ def deliver_tui(name: str) -> None:
             else:
                 valid, reason = validate_endpoint(endpoint, owner_thread)
                 if valid:
-                    try:
-                        plain = tmux_capture(endpoint, escaped=False)
-                        escaped = tmux_capture(endpoint, escaped=True)
-                    except subprocess.SubprocessError:
-                        valid, reason = False, "pane-capture-failed"
-                    if valid and screen_is_busy(plain):
-                        reason = "owning-tui-busy"
-                    elif valid and not composer_is_empty(escaped):
-                        reason = "composer-not-empty"
-                    elif valid:
-                        set_delivery(name, "delivering", "safe-idle-boundary")
-                        delivered, submit_reason = try_tui_submission(
-                            name, record, endpoint
-                        )
-                        if delivered:
-                            set_delivery(
-                                name,
-                                "delivered",
-                                submit_reason,
-                                delivered_at=now_iso(),
-                                pane_id=endpoint["pane_id"],
-                            )
-                            return
-                        set_delivery(name, "pending", submit_reason)
-                        # A prompt may now be present.  Do not paste a duplicate.
-                        if submit_reason not in {
-                            "enter-key-failed",
-                            "composer-did-not-acknowledge-submit",
-                        }:
-                            return
-                        time.sleep(min(2.0, poll_seconds))
-                        continue
+                    with tui_delivery_lock() as acquired:
+                        if not acquired:
+                            reason = "another-job-is-delivering"
+                        else:
+                            # Revalidate after obtaining the cross-job lock because
+                            # another delivery may have changed the TUI meanwhile.
+                            valid, reason = validate_endpoint(endpoint, owner_thread)
+                            if valid:
+                                try:
+                                    plain = tmux_capture(endpoint, escaped=False)
+                                    escaped = tmux_capture(endpoint, escaped=True)
+                                except subprocess.SubprocessError:
+                                    valid, reason = False, "pane-capture-failed"
+                            if valid and screen_is_busy(plain):
+                                reason = "owning-tui-busy"
+                            elif valid and not composer_is_empty(escaped):
+                                reason = "composer-not-empty"
+                            elif valid:
+                                set_delivery(name, "delivering", "safe-idle-boundary")
+                                delivered, submit_reason = try_tui_submission(
+                                    name, record, endpoint
+                                )
+                                if delivered:
+                                    set_delivery(
+                                        name,
+                                        "delivered",
+                                        submit_reason,
+                                        delivered_at=now_iso(),
+                                        pane_id=endpoint["pane_id"],
+                                    )
+                                    return
+                                set_delivery(name, "pending", submit_reason)
+                                # A prompt may now be present.  Do not paste a duplicate.
+                                if submit_reason not in {
+                                    "enter-key-failed",
+                                    "composer-did-not-acknowledge-submit",
+                                }:
+                                    return
+                                time.sleep(min(2.0, poll_seconds))
+                                continue
             if reason != last_reason:
                 set_delivery(name, "pending", reason)
                 last_reason = reason
@@ -648,7 +765,7 @@ def launch_headless(record: dict[str, Any]) -> None:
     codex_bin = os.environ.get("CODEX_LONG_JOBS_CODEX_BIN", "codex")
     output = job_dir(name) / "headless-continuation.log"
     try:
-        with open(output, "ab", buffering=0) as handle:
+        with open_log_for_append(output, create=True) as handle:
             child = subprocess.Popen(
                 [codex_bin, "exec", "resume", thread, completion_prompt(record)],
                 cwd=record["cwd"],
@@ -684,6 +801,109 @@ def finalize_delivery(name: str) -> None:
         deliver_tui(name)
 
 
+def terminate_process_group(identity: dict[str, Any] | None) -> None:
+    """Best-effort cleanup for a command orphaned by worker failure."""
+    if not identity_alive(identity):
+        return
+    pid = int(identity["pid"])
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and identity_alive(identity):
+        time.sleep(0.05)
+    if identity_alive(identity):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pid, signal.SIGKILL)
+
+
+def supervisor_main(name: str) -> int:
+    """Watch the worker and finalize state if the worker exits unexpectedly."""
+    name = validate_name(name)
+    supervisor_id = process_identity(os.getpid())
+
+    def supervising(record: dict[str, Any]) -> dict[str, Any]:
+        if record["status"] != "queued":
+            raise JobError(f"job is not queued: {name}")
+        record["supervisor_identity"] = supervisor_id
+        return record
+
+    update_job(name, supervising)
+    runtime_log = job_dir(name) / "worker-runtime.log"
+    try:
+        with open_log_for_append(runtime_log, create=True) as handle:
+            worker = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "_worker",
+                    "--name",
+                    name,
+                ],
+                cwd=read_job(name)["cwd"],
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except OSError as exc:
+        worker = None
+        return_code: int | None = None
+        launch_error = f"worker-launch-failed={exc.__class__.__name__}:{exc.errno}"
+    else:
+
+        def worker_launched(record: dict[str, Any]) -> dict[str, Any]:
+            record["worker_spawn_pid"] = worker.pid
+            return record
+
+        update_job(name, worker_launched)
+        return_code = worker.wait()
+        launch_error = None
+
+    record = read_job(name)
+    if record["status"] in TERMINAL_STATUSES:
+        if (
+            return_code not in {0, 1}
+            and record.get("delivery", {}).get("status") not in DELIVERY_DONE
+        ):
+            finalize_delivery(name)
+        return return_code or 0
+
+    terminate_process_group(record.get("child_identity"))
+    release_reserve(name)
+    worker_signal = None
+    worker_exit_code = return_code
+    worker_signal = return_code_signal(return_code)
+    if worker_signal:
+        worker_exit_code = None
+    if launch_error:
+        failure_reason = launch_error
+    elif worker_signal:
+        failure_reason = f"worker-signal={worker_signal}"
+    else:
+        failure_reason = f"worker-exit={return_code}-before-terminal-state"
+
+    def worker_failed(current: dict[str, Any]) -> dict[str, Any]:
+        reasons = list(current.get("failure_reasons", []))
+        reasons.append(failure_reason)
+        current.update(
+            status="failed",
+            completed_at=now_iso(),
+            exit_code=None,
+            signal=None,
+            worker_exit_code=worker_exit_code,
+            worker_signal=worker_signal,
+            failure_reasons=reasons,
+            child_pid=None,
+            child_identity=None,
+        )
+        return current
+
+    update_job(name, worker_failed)
+    finalize_delivery(name)
+    return 1
+
+
 def worker_main(name: str) -> int:
     name = validate_name(name)
     worker_id = process_identity(os.getpid())
@@ -699,16 +919,11 @@ def worker_main(name: str) -> int:
     record = update_job(name, starting)
     command = list(record["command"])
     log_path = Path(record["log"])
-    marker = (
-        re.compile(record["success_pattern"]) if record.get("success_pattern") else None
-    )
+    marker = compile_success_pattern(record.get("success_pattern"))
     marker_seen = marker is None
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     marker_buffer = ""
     log_error: str | None = None
-    test_fail_after = int(
-        os.environ.get("CODEX_LONG_JOBS_TEST_LOG_FAIL_AFTER_BYTES", "-1")
-    )
     logged_bytes = 0
     child: subprocess.Popen[bytes] | None = None
     return_code: int | None = None
@@ -733,31 +948,34 @@ def worker_main(name: str) -> int:
 
         update_job(name, running)
         assert child.stdout is not None
-        with open(log_path, "ab", buffering=0) as log_handle:
+        read_chunk = getattr(child.stdout, "read1", child.stdout.read)
+        with open_log_for_append(log_path) as log_handle:
             while True:
-                chunk = child.stdout.read(64 * 1024)
+                chunk = read_chunk(64 * 1024)
                 if not chunk:
                     break
                 text = decoder.decode(chunk)
                 if marker and not marker_seen:
-                    marker_buffer = (marker_buffer + text)[-128 * 1024 :]
+                    marker_buffer = (marker_buffer + text)[-MAX_MARKER_BUFFER_BYTES:]
                     marker_seen = marker.search(marker_buffer) is not None
                 if log_error is None:
                     try:
-                        if (
-                            test_fail_after >= 0
-                            and logged_bytes + len(chunk) > test_fail_after
-                        ):
-                            raise OSError(errno.ENOSPC, "simulated log filesystem full")
-                        log_handle.write(chunk)
-                        logged_bytes += len(chunk)
+                        logged_bytes = write_log_chunk(log_handle, chunk, logged_bytes)
                     except OSError as exc:
                         log_error = f"{exc.__class__.__name__}: {exc}"
             tail = decoder.decode(b"", final=True)
             if marker and not marker_seen and tail:
                 marker_seen = (
-                    marker.search((marker_buffer + tail)[-128 * 1024 :]) is not None
+                    marker.search((marker_buffer + tail)[-MAX_MARKER_BUFFER_BYTES:])
+                    is not None
                 )
+            if log_error is None:
+                try:
+                    if os.environ.get("CODEX_LONG_JOBS_TEST_LOG_FSYNC_FAIL") == "1":
+                        raise OSError(errno.EIO, "simulated log fsync failure")
+                    os.fsync(log_handle.fileno())
+                except OSError as exc:
+                    log_error = f"{exc.__class__.__name__}: {exc}"
         return_code = child.wait()
     except BaseException as exc:
         if isinstance(exc, KeyboardInterrupt):
@@ -773,12 +991,14 @@ def worker_main(name: str) -> int:
     release_reserve(name)
     signal_name = None
     exit_code = return_code
-    if return_code is not None and return_code < 0:
-        signal_name = signal.Signals(-return_code).name
+    signal_name = return_code_signal(return_code)
+    if signal_name:
         exit_code = None
     succeeded = return_code == 0 and log_error is None and marker_seen
     reasons: list[str] = []
-    if return_code != 0:
+    if signal_name:
+        reasons.append(f"command-signal={signal_name}")
+    elif return_code != 0:
         reasons.append(f"command-exit={return_code}")
     if log_error:
         reasons.append(f"log-write-failed={log_error}")
@@ -809,8 +1029,39 @@ def choose_log_path(name: str, requested: str | None) -> Path:
         path = Path(requested).expanduser()
         if not path.is_absolute():
             path = Path.cwd() / path
-        return path.resolve()
-    return (state_root() / "logs" / f"{name}.log").resolve()
+        return Path(os.path.abspath(path))
+    return Path(os.path.abspath(state_root() / "logs" / f"{name}.log"))
+
+
+def prepare_log_file(path: Path, *, overwrite: bool, control_directory: Path) -> bool:
+    """Create a private regular log file and return whether it was new."""
+    if path == control_directory or control_directory in path.parents:
+        raise JobError("the log path cannot be inside the job control directory")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existed = path.exists() or path.is_symlink()
+    if existed:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise JobError(f"log path is not a regular file: {path}")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise JobError(f"log file is not owned by the current user: {path}")
+        if not overwrite:
+            raise JobError(f"log already exists: {path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC
+    flags |= os.O_TRUNC if overwrite else os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise JobError(f"log path is not a regular file: {path}")
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise JobError(f"log file is not owned by the current user: {path}")
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    return not existed
 
 
 def select_delivery(
@@ -830,7 +1081,8 @@ def viewer_label() -> str:
 
 
 def viewer_session(name: str) -> str:
-    return f"clj-{name}"[:80]
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:10]
+    return f"clj-{name[:65]}-{digest}"
 
 
 def start_viewer(name: str, log_path: Path) -> tuple[bool, str]:
@@ -871,7 +1123,7 @@ def start_viewer(name: str, log_path: Path) -> tuple[bool, str]:
 
 
 def spawn_detached(arguments: list[str], *, cwd: str, log_path: Path) -> int:
-    with open(log_path, "ab", buffering=0) as handle:
+    with open_log_for_append(log_path, create=True) as handle:
         child = subprocess.Popen(
             arguments,
             cwd=cwd,
@@ -897,17 +1149,9 @@ def command_start(args: argparse.Namespace) -> int:
         command.pop(0)
     if not command:
         raise JobError("a command is required after --")
+    compile_success_pattern(args.success_pattern)
     directory = job_dir(name)
-    if directory.exists():
-        raise JobError(f"job already exists: {name}")
-    ensure_private_dir(directory)
     log_path = choose_log_path(name, args.log)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT
-    flags |= os.O_TRUNC if args.overwrite_log else os.O_EXCL
-    fd = os.open(log_path, flags, 0o600)
-    os.close(fd)
-    log_path.chmod(0o600)
     endpoint, endpoint_reason = capture_endpoint()
     thread_id = os.environ.get("CODEX_THREAD_ID", "")
     if not THREAD_RE.fullmatch(thread_id):
@@ -940,16 +1184,45 @@ def command_start(args: argparse.Namespace) -> int:
             "wait_seconds": args.delivery_wait_seconds,
         },
     }
-    create_reserve(name)
-    atomic_write_json(state_file(name), record)
-    worker_pid = spawn_detached(
-        [sys.executable, str(Path(__file__).resolve()), "_worker", "--name", name],
-        cwd=record["cwd"],
-        log_path=log_path,
-    )
+    directory_was_created = False
+    log_was_created = False
+    supervisor_pid: int | None = None
+    try:
+        directory.mkdir(mode=0o700)
+        directory_was_created = True
+        ensure_private_dir(directory)
+        log_was_created = prepare_log_file(
+            log_path, overwrite=args.overwrite_log, control_directory=directory
+        )
+        create_reserve(name)
+        atomic_write_json(state_file(name), record)
+        supervisor_pid = spawn_detached(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "_supervisor",
+                "--name",
+                name,
+            ],
+            cwd=record["cwd"],
+            log_path=job_dir(name) / "supervisor-runtime.log",
+        )
+    except FileExistsError as exc:
+        if supervisor_pid is None and directory_was_created:
+            shutil.rmtree(directory)
+        raise JobError(f"job already exists or log path is occupied: {name}") from exc
+    except BaseException:
+        if supervisor_pid is None:
+            if directory_was_created:
+                with contextlib.suppress(OSError):
+                    shutil.rmtree(directory)
+            if log_was_created:
+                with contextlib.suppress(OSError):
+                    log_path.unlink()
+        raise
 
     def launched(current: dict[str, Any]) -> dict[str, Any]:
-        current["worker_spawn_pid"] = worker_pid
+        current["supervisor_spawn_pid"] = supervisor_pid
         return current
 
     update_job(name, launched)
@@ -960,7 +1233,7 @@ def command_start(args: argparse.Namespace) -> int:
     if viewer_mode == "tmux":
         viewer_ok, viewer_reason = start_viewer(name, log_path)
     print(f"job={name}")
-    print(f"worker_pid={worker_pid}")
+    print(f"supervisor_pid={supervisor_pid}")
     print(f"log={log_path}")
     print(f"state={state_file(name)}")
     print(f"delivery_mode={mode}")
@@ -1070,6 +1343,7 @@ def command_rebind(args: argparse.Namespace) -> int:
         if (
             updated["status"] in TERMINAL_STATUSES
             and updated.get("delivery", {}).get("mode") == "tui"
+            and updated.get("delivery", {}).get("status") not in DELIVERY_DONE
         ):
             spawn_delivery(name)
         print(f"rebound={name}")
@@ -1086,9 +1360,13 @@ def command_retry_delivery(args: argparse.Namespace) -> int:
     record = read_job(name)
     if record["status"] not in TERMINAL_STATUSES:
         raise JobError("job is not terminal")
+    if record.get("delivery", {}).get("mode") != "tui":
+        raise JobError("job does not use TUI delivery")
     if record.get("delivery", {}).get("status") == "delivered":
         print("delivery already completed")
         return 0
+    if record.get("delivery", {}).get("status") in DELIVERY_DONE:
+        raise JobError("job delivery is already finalized")
     pid = spawn_delivery(name)
     print(f"delivery_worker_pid={pid}")
     return 0
@@ -1144,7 +1422,7 @@ def parser() -> argparse.ArgumentParser:
         "--delivery", choices=["auto", "tui", "headless", "event-only"], default="auto"
     )
     start.add_argument("--viewer", choices=["auto", "tmux", "none"], default="auto")
-    start.add_argument("--delivery-wait-seconds", type=int, default=86400)
+    start.add_argument("--delivery-wait-seconds", type=positive_int, default=86400)
     start.add_argument("--no-desktop-notify", action="store_true")
     start.add_argument("command", nargs=argparse.REMAINDER)
     start.set_defaults(func=command_start)
@@ -1176,7 +1454,7 @@ def parser() -> argparse.ArgumentParser:
 
     tail = sub.add_parser("tail", help="follow a job log in the current terminal")
     tail.add_argument("--name", required=True)
-    tail.add_argument("--lines", type=int, default=200)
+    tail.add_argument("--lines", type=positive_int, default=200)
     tail.set_defaults(func=command_tail)
 
     doctor = sub.add_parser(
@@ -1187,6 +1465,10 @@ def parser() -> argparse.ArgumentParser:
     worker = sub.add_parser("_worker")
     worker.add_argument("--name", required=True)
     worker.set_defaults(func=lambda args: worker_main(args.name))
+
+    supervisor = sub.add_parser("_supervisor")
+    supervisor.add_argument("--name", required=True)
+    supervisor.set_defaults(func=lambda args: supervisor_main(args.name))
 
     deliver = sub.add_parser("_deliver")
     deliver.add_argument("--name", required=True)
@@ -1207,6 +1489,9 @@ def main(argv: list[str] | None = None) -> int:
             "re-run the identical command with scoped permission for the configured state directory",
             file=sys.stderr,
         )
+        return 1
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"codex-long-jobs: {exc.__class__.__name__}: {exc}", file=sys.stderr)
         return 1
 
 

@@ -13,11 +13,16 @@
 
 ## Runtime architecture
 
-`start` launches one Python worker with a new OS session and closed interactive
-stdin. The worker launches the requested command in another process group,
-streams combined stdout and stderr to the configured log, records terminal
-state atomically, and then invokes the delivery layer. No model call or Codex
-turn occurs while the command is merely running.
+`start` launches a detached Python supervisor with a new OS session and closed
+interactive stdin. The supervisor launches and waits for the worker. The worker
+launches the requested command in another process group, streams combined
+stdout and stderr to the configured log, records terminal state atomically, and
+then invokes the delivery layer. No model call or Codex turn occurs while the
+command is merely running.
+
+If the worker exits before terminal state, the supervisor terminates the
+validated child process group, records `worker-exit` or `worker-signal`, and
+invokes delivery. The supervisor is deliberately separate from the tmux viewer.
 
 Run `start`, `rebind`, and `retry-delivery` outside the Codex tool sandbox with
 scoped host permission. The sandbox owns and reaps its descendants even if they
@@ -40,6 +45,11 @@ The worker distinguishes command exit, terminating signal, log write failure,
 and missing success marker in `failure_reasons`. A child command that crashes,
 is killed, or exits after an ENOSPC error is therefore terminal and triggers
 the same completion path as success.
+
+Command output writes handle partial writes explicitly and fsync the completed
+log. State updates use atomic replacement, fsync the state file, and fsync the
+parent directory. A failure of any applicable durability step prevents a
+successful terminal classification.
 
 The worker reserves 64 KiB inside the per-job state directory at launch. It
 releases that file before writing final state, improving the chance that a
@@ -64,14 +74,18 @@ the same unique token remains visible, it retries only the key event; it never
 pastes a second prompt. An ambiguous state remains durably pending for manual
 inspection instead of risking duplicate delivery.
 
+A state-root lock serializes the validation and submission boundary across all
+jobs. Two jobs that complete together cannot both observe and paste into the
+same empty composer.
+
 The completion prompt contains job identity and local evidence paths, never
 captured process output. Logs are untrusted evidence.
 
 ## Session exit and resume
 
-The job keeps running when Codex exits because neither the worker nor command
-is owned by the tmux viewer. However, the original delivery binding becomes
-invalid when the Codex PID changes.
+The job keeps running when Codex exits because the supervisor, worker, and
+command are not owned by the tmux viewer. However, the original delivery
+binding becomes invalid when the Codex PID changes.
 
 Resume the original thread, then invoke `rebind --name NAME` or `rebind --all`
 from its new tmux-hosted TUI. Rebind requires the current `CODEX_THREAD_ID` to
@@ -87,8 +101,8 @@ delivery.
 
 tmux is not the process supervisor. `--viewer tmux` creates a `tail -F` session
 on a dedicated tmux server label (`codex-long-jobs` by default). Killing that
-server loses only the viewer; the worker, command, log, and state continue.
-Run `view --name NAME` to recreate it.
+server loses only the viewer; the supervisor, worker, command, log, and state
+continue. Run `view --name NAME` to recreate it.
 
 TUI delivery naturally cannot occur while the owning tmux server or pane is
 gone. State remains pending and can be rebound after the Codex thread resumes.
@@ -101,9 +115,9 @@ if the command itself returns zero. State and log paths should preferably live
 on different filesystems for large training jobs.
 
 If the entire host filesystem is full beyond the reserved state allowance, or
-the worker itself is killed with SIGKILL/OOM before it can finalize, no
-userspace-only wrapper can guarantee a completion record. Use a service manager
-or cluster scheduler for workloads requiring host-crash recovery.
+the supervisor itself is killed with SIGKILL/OOM, no userspace-only wrapper can
+guarantee a completion record. Use a service manager or cluster scheduler for
+workloads requiring host-crash recovery.
 
 ## Security boundaries
 
@@ -125,5 +139,6 @@ or cluster scheduler for workloads requiring host-crash recovery.
   for direct Codex CLI TUI delivery and the visual log viewer.
 - Direct TUI delivery uses conservative tmux input injection because Codex CLI
   does not yet expose a stable public idle-wake API for arbitrary local tools.
-- The worker survives tmux failure, not machine reboot. Jobs are host-local.
+- The supervisor and worker survive tmux failure, not machine reboot. Jobs are
+  host-local.
 - State reports process completion, not semantic correctness; verify artifacts.
