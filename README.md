@@ -148,9 +148,8 @@ From an existing Codex session, a new user can ask Codex to perform the
 installation:
 
 ```text
-Install the skill from the root of https://github.com/zycdev/codex-long-jobs
-as codex-long-jobs in my user Codex skills directory. Verify the installed
-SKILL.md and tell me when the skill will be available.
+Install https://github.com/zycdev/codex-long-jobs as a user Codex skill and
+tell me when it is ready.
 ```
 
 After Codex completes the installation, the new skill is available on the next
@@ -174,9 +173,8 @@ For example, ask a tmux-hosted OpenAI Codex CLI session to launch a multi-hour
 deep learning training run:
 
 ```text
-Use $codex-long-jobs to run my model training command in the background. Do not
-poll it with model turns. Wake this original Codex session when training exits,
-then inspect the job state, log, and final checkpoint before reporting success.
+Run my model training with $codex-long-jobs without model polling. Wake this
+session when it finishes and verify the checkpoint.
 ```
 
 The corresponding controller command can look like this:
@@ -290,7 +288,15 @@ the same final result inspection and authorized follow-up work.
 
 The worker and command continue if the original Codex process exits. The old
 TUI binding then becomes invalid because its Codex process identity changed.
-Resume the same original thread in any tmux pane and run:
+After resuming the same original thread in any tmux pane, send Codex this
+prompt:
+
+```text
+I resumed the original Codex thread in this tmux pane. Use $codex-long-jobs to
+rebind its pending jobs to this TUI without polling them.
+```
+
+The skill performs the equivalent controller action:
 
 ```bash
 scripts/codex-long-jobs rebind --all
