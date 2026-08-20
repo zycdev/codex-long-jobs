@@ -125,6 +125,78 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(RUNTIME.is_descendant(os.getpid(), os.getpid()))
         self.assertFalse(RUNTIME.is_descendant(os.getpid(), 999_999_999))
 
+    def test_codex_ancestor_and_sandbox_walks_are_deterministic(self) -> None:
+        process_tree = {
+            30: {"ppid": 20, "start": "30", "exe": "/usr/bin/python"},
+            20: {"ppid": 10, "start": "20", "exe": "/opt/bin/codex (deleted)"},
+        }
+        with (
+            mock.patch.dict(
+                os.environ, {"CODEX_LONG_JOBS_TEST_CODEX_PID": ""}, clear=False
+            ),
+            mock.patch.object(
+                RUNTIME, "process_info", side_effect=lambda pid: process_tree[pid]
+            ),
+        ):
+            self.assertEqual(
+                RUNTIME.find_codex_ancestor(30),
+                {
+                    "pid": 20,
+                    "start": "20",
+                    "exe": "/opt/bin/codex (deleted)",
+                },
+            )
+
+        with mock.patch.object(
+            RUNTIME,
+            "process_info",
+            return_value={"ppid": 0, "start": "1", "exe": "/usr/bin/python"},
+        ):
+            self.assertIsNone(RUNTIME.find_codex_ancestor(1))
+        with mock.patch.object(RUNTIME, "process_info", side_effect=OSError("gone")):
+            self.assertIsNone(RUNTIME.find_codex_ancestor(30))
+
+        sandbox_tree = {
+            30: {
+                "ppid": 20,
+                "start": "30",
+                "exe": "/usr/bin/python",
+                "cmdline": "python",
+            },
+            20: {
+                "ppid": 1,
+                "start": "20",
+                "exe": "/usr/bin/codex-linux-sandbox",
+                "cmdline": "codex-linux-sandbox",
+            },
+        }
+        with (
+            mock.patch.dict(
+                os.environ, {"CODEX_LONG_JOBS_ALLOW_SANDBOX": "0"}, clear=False
+            ),
+            mock.patch.object(
+                RUNTIME, "process_info", side_effect=lambda pid: sandbox_tree[pid]
+            ),
+        ):
+            self.assertTrue(RUNTIME.running_under_codex_sandbox(30))
+
+        with (
+            mock.patch.dict(
+                os.environ, {"CODEX_LONG_JOBS_ALLOW_SANDBOX": "0"}, clear=False
+            ),
+            mock.patch.object(
+                RUNTIME,
+                "process_info",
+                return_value={
+                    "ppid": 0,
+                    "start": "1",
+                    "exe": "/usr/bin/python",
+                    "cmdline": "python",
+                },
+            ),
+        ):
+            self.assertFalse(RUNTIME.running_under_codex_sandbox(1))
+
     def test_signal_names_have_a_numeric_fallback(self) -> None:
         self.assertEqual(RUNTIME.return_code_signal(-15), "SIGTERM")
         self.assertEqual(RUNTIME.return_code_signal(-999), "SIG999")
