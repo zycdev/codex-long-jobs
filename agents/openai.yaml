@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Long Jobs"
-  short_description: "Run background jobs and wake Codex on completion"
+  short_description: "Run or cancel background jobs and wake Codex"
   default_prompt: "Use $codex-long-jobs to run this long-running command as a detached background job, end the current Codex turn without model polling, and wake the owning Codex CLI session when it completes."

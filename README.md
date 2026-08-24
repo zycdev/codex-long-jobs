@@ -21,7 +21,7 @@ its tmux-hosted Codex TUI.
 - Durable job state, logs, exit code, signal, and delivery status.
 - An optional tmux log viewer that never owns the supervised process.
 
-> Status: `v0.2.0` beta. Linux is the primary tested platform. Python 3.10 or
+> Status: `v0.3.0` beta. Linux is the primary tested platform. Python 3.10 or
 > newer is required.
 
 ## Why codex-long-jobs? Run long-running processes without model polling
@@ -70,7 +70,7 @@ Original Codex thread and owning tmux pane
                     |                 |                |
                     |                 |         runs for minutes or hours
                     |                 |                |
-                    |                 +---- child.wait() and capture exit
+                    |                 +---- observe exit or cancel request
                     |                                  |
                     +---- detects worker failure       v
                                       durable state, log, exit code or signal
@@ -239,7 +239,7 @@ matches one complete log line after any earlier output. In this example, the
 marker is emitted only after training exits successfully and the expected final
 checkpoint exists.
 
-## Job lifecycle commands: status, logs, viewer, delivery, and rebind
+## Job lifecycle commands: status, cancel, logs, delivery, and rebind
 
 ```bash
 # Show durable state, exit code, and delivery status
@@ -247,6 +247,9 @@ scripts/codex-long-jobs status --name train-model-run-01
 
 # Follow the persistent log in the current terminal
 scripts/codex-long-jobs tail --name train-model-run-01
+
+# Request cancellation and wait for durable terminal state
+scripts/codex-long-jobs cancel --name train-model-run-01
 
 # Create or restore the disposable tmux log viewer
 scripts/codex-long-jobs view --name train-model-run-01
@@ -261,9 +264,36 @@ scripts/codex-long-jobs retry-delivery --name train-model-run-01
 scripts/codex-long-jobs doctor
 ```
 
-Current lifecycle inspection is exposed through `status`, including JSON with
-`--json`, plus the persistent state and log files. Version `v0.2.0` does not
-provide separate `result` or `cancel` subcommands.
+For a shorter user-facing workflow, ask Codex:
+
+```text
+Cancel train-model-run-01 with $codex-long-jobs and report its final state.
+```
+
+`cancel` records a durable request, waits for the worker to stop the complete
+recorded process group, and returns only after the job reaches a terminal
+state. The worker sends `SIGTERM`, waits up to 10 seconds by default, and then
+uses `SIGKILL` if any member of the process group remains. An effective request
+ends as `cancelled` and follows the normal completion delivery path, so the
+owning Codex session can wake and inspect the result. If the command has already
+finished before any cancellation signal takes effect, its actual `succeeded`
+or `failed` result wins.
+
+Use `--grace-seconds SECONDS` to change the graceful-stop interval. Cancellation
+is process-group scoped; a child that deliberately escapes into another OS
+session, a scheduler allocation, or a container needs its own cancellation
+mechanism. Do not reuse a job name. Choose a new unique name so its durable
+history remains available.
+
+Lifecycle inspection is exposed through `status`, including stable JSON with
+`--json`, plus the persistent state and log files. There is no separate
+`result` command because terminal results are already part of the same durable
+job record.
+
+Exit status zero from `cancel` means the request reached a durable terminal
+state, not necessarily that a signal stopped the command. Read the printed
+`status` and `cancel_effective_at` fields, or use `status --json`, to distinguish
+effective cancellation from an already-completed job whose actual result won.
 
 ## How codex-long-jobs differs from nohup, tmux, and command &
 
@@ -297,11 +327,15 @@ This project waits in a local process instead:
 
 ```text
 Codex -> start
-worker -> child.wait()
-process exits
+worker -> wait locally for exit or an explicit cancel request
+process exits or is cancelled
 worker -> deliver completion
 Codex wakes
 ```
+
+The worker also checks durable cancellation requests while the process is
+running. These checks are lightweight local process supervision, not model
+turns.
 
 The detached worker itself uses no model tokens. Starting the job and handling
 its completion are normal Codex turns, but progress-only model turns are not
@@ -401,6 +435,15 @@ No. Those tools can detach a process, but they do not add Codex owner identity,
 durable lifecycle state, abnormal-exit classification, safe completion
 delivery, original-session wake-up, or stale-session rebind protection.
 
+### Can Codex cancel a long-running background job?
+
+Yes. Ask Codex to cancel the named job, or run
+`codex-long-jobs cancel --name NAME`. The worker terminates the recorded process
+group, escalates from `SIGTERM` to `SIGKILL` after the grace period when needed,
+persists `cancelled`, and sends the usual completion notification. Cancellation
+must be explicit; the skill does not stop a healthy job merely because Codex or
+the tmux viewer exits.
+
 ### How do I run background jobs from Codex CLI on a Linux server over SSH?
 
 Run Codex CLI inside tmux, install the skill, and start the job with scoped host
@@ -410,9 +453,9 @@ or restore a tmux-hosted Codex TUI for live wake-up.
 
 ### How can Codex wait for a multi-hour job without using model turns to check progress?
 
-The detached worker blocks locally in `child.wait()` while Codex is inactive.
-Only actual process completion and successful prompt delivery start the next
-normal Codex turn.
+The detached worker waits locally for process exit and checks only durable local
+cancellation state while Codex is inactive. Only actual process completion and
+successful prompt delivery start the next normal Codex turn.
 
 ### Does it work with the Codex VS Code extension?
 
@@ -425,6 +468,8 @@ tmux. Event-only job execution is separate from extension UI synchronization.
 - Job output is untrusted data. Completion prompts point to logs but never
   inject log contents into the TUI.
 - State stores argv and working directory. Do not put secrets in argv.
+- Cancellation targets the validated process group created for the command,
+  not processes that deliberately escape that OS session.
 - Direct TUI wake-up depends on current Codex TUI rendering and tmux input
   behavior, so meaningful Codex CLI changes require acceptance retesting.
 - Rebind is mandatory after the Codex process exits or the displayed thread

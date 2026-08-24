@@ -16,9 +16,11 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
+import selectors
 import shutil
 import signal
 import stat
@@ -30,14 +32,17 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SCHEMA_VERSION = 1
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 THREAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,160}$")
-TERMINAL_STATUSES = {"succeeded", "failed"}
+TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 DELIVERY_DONE = {"delivered", "disabled", "headless-dispatched"}
 BUSY_MARKERS = ("esc to interrupt", "ctrl+c to interrupt")
 MAX_MARKER_BUFFER_BYTES = 128 * 1024
+CANCEL_CHECK_INTERVAL_SECONDS = 0.5
+CANCEL_FINALIZE_WAIT_SECONDS = 5.0
+CANCEL_SUPPORTED_SINCE = (0, 3, 0)
 
 
 class JobError(RuntimeError):
@@ -225,6 +230,26 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a finite number zero or greater")
+    return parsed
+
+
+def version_tuple(value: str) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", value)
+    if not match:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
+def supports_cancellation(record: dict[str, Any]) -> bool:
+    parsed = version_tuple(str(record.get("runtime_version", "")))
+    return parsed is not None and parsed >= CANCEL_SUPPORTED_SINCE
+
+
 def return_code_signal(return_code: int | None) -> str | None:
     if return_code is None or return_code >= 0:
         return None
@@ -279,12 +304,19 @@ def open_log_for_append(path: Path, *, create: bool = False) -> Any:
         raise
 
 
-def linux_proc_info(pid: int) -> dict[str, Any]:
+def linux_proc_stat_fields(pid: int) -> list[str]:
     stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     close = stat_line.rfind(")")
     if close < 0:
         raise JobError(f"invalid /proc stat for pid {pid}")
     fields = stat_line[close + 2 :].split()
+    if len(fields) <= 19:
+        raise JobError(f"incomplete /proc stat for pid {pid}")
+    return fields
+
+
+def linux_proc_info(pid: int) -> dict[str, Any]:
+    fields = linux_proc_stat_fields(pid)
     try:
         cmdline = (
             Path(f"/proc/{pid}/cmdline")
@@ -296,7 +328,10 @@ def linux_proc_info(pid: int) -> dict[str, Any]:
         cmdline = ""
     return {
         "pid": pid,
+        "state": fields[0],
         "ppid": int(fields[1]),
+        "pgrp": int(fields[2]),
+        "session": int(fields[3]),
         "start": fields[19],
         "exe": os.path.realpath(f"/proc/{pid}/exe"),
         "cmdline": cmdline,
@@ -342,6 +377,50 @@ def identity_alive(identity: dict[str, Any] | None) -> bool:
     except (OSError, ValueError, KeyError, JobError, subprocess.SubprocessError):
         return False
     return actual == identity
+
+
+def process_group_identity(pid: int) -> dict[str, Any]:
+    return {
+        "pgid": os.getpgid(pid),
+        "session": os.getsid(pid),
+        "leader": process_identity(pid),
+    }
+
+
+def process_group_alive(group: dict[str, Any] | None) -> bool:
+    if not group:
+        return False
+    try:
+        pgid = int(group["pgid"])
+        session_id = int(group["session"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if sys.platform.startswith("linux"):
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                fields = linux_proc_stat_fields(int(entry.name))
+            except (OSError, JobError, ValueError):
+                continue
+            if (
+                int(fields[2]) == pgid
+                and int(fields[3]) == session_id
+                and fields[0] != "Z"
+            ):
+                return True
+        return False
+    return identity_alive(group.get("leader"))
+
+
+def signal_process_group(group: dict[str, Any] | None, signum: int) -> bool:
+    if not process_group_alive(group):
+        return False
+    try:
+        os.killpg(int(group["pgid"]), signum)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def find_codex_ancestor(start_pid: int) -> dict[str, Any] | None:
@@ -573,6 +652,8 @@ def completion_prompt(record: dict[str, Any]) -> str:
     token = record["delivery"]["token"]
     if record["status"] == "succeeded":
         lead = f"Background job '{name}' completed successfully."
+    elif record["status"] == "cancelled":
+        lead = f"Background job '{name}' was cancelled."
     else:
         lead = f"Background job '{name}' failed."
     return (
@@ -801,19 +882,89 @@ def finalize_delivery(name: str) -> None:
         deliver_tui(name)
 
 
-def terminate_process_group(identity: dict[str, Any] | None) -> None:
+def terminate_process_group(
+    identity: dict[str, Any] | None,
+    group: dict[str, Any] | None = None,
+    *,
+    grace_seconds: float = 5.0,
+) -> str | None:
     """Best-effort cleanup for a command orphaned by worker failure."""
-    if not identity_alive(identity):
-        return
-    pid = int(identity["pid"])
+    if group is None and identity_alive(identity):
+        pid = int(identity["pid"])
+        group = {"pgid": pid, "session": pid, "leader": identity}
+    if not process_group_alive(group):
+        return None
+    strongest_signal: str | None = None
     with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and identity_alive(identity):
+        if signal_process_group(group, signal.SIGTERM):
+            strongest_signal = "SIGTERM"
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline and process_group_alive(group):
         time.sleep(0.05)
-    if identity_alive(identity):
+    if process_group_alive(group):
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(pid, signal.SIGKILL)
+            if signal_process_group(group, signal.SIGKILL):
+                strongest_signal = "SIGKILL"
+    return strongest_signal
+
+
+def record_cancel_effective(name: str, signal_name: str | None) -> dict[str, Any]:
+    def effective(record: dict[str, Any]) -> dict[str, Any]:
+        if not record.get("cancel_requested_at"):
+            return record
+        record.setdefault("cancel_effective_at", now_iso())
+        if signal_name is not None:
+            record["cancel_signal"] = signal_name
+        return record
+
+    return update_job(name, effective)
+
+
+def cancelled_terminal(
+    record: dict[str, Any],
+    *,
+    exit_code: int | None,
+    signal_name: str | None,
+    marker_seen: bool,
+    log_error: str | None,
+    failure_reasons: list[str],
+) -> dict[str, Any]:
+    cancelled_at = now_iso()
+    record.update(
+        status="cancelled",
+        completed_at=cancelled_at,
+        cancelled_at=cancelled_at,
+        exit_code=exit_code,
+        signal=signal_name,
+        marker_seen=marker_seen,
+        log_error=log_error,
+        failure_reasons=failure_reasons,
+        child_pid=None,
+        child_identity=None,
+        child_process_group=None,
+    )
+    return record
+
+
+def finalize_cancelled_before_launch(name: str) -> int:
+    release_reserve(name)
+
+    def terminal(record: dict[str, Any]) -> dict[str, Any]:
+        if not record.get("cancel_requested_at"):
+            raise JobError(f"job cancellation was not requested: {name}")
+        record.setdefault("cancel_effective_at", now_iso())
+        return cancelled_terminal(
+            record,
+            exit_code=None,
+            signal_name=None,
+            marker_seen=record.get("success_pattern") is None,
+            log_error=None,
+            failure_reasons=[],
+        )
+
+    update_job(name, terminal)
+    finalize_delivery(name)
+    return 0
 
 
 def supervisor_main(name: str) -> int:
@@ -827,7 +978,9 @@ def supervisor_main(name: str) -> int:
         record["supervisor_identity"] = supervisor_id
         return record
 
-    update_job(name, supervising)
+    record = update_job(name, supervising)
+    if record.get("cancel_requested_at"):
+        return finalize_cancelled_before_launch(name)
     runtime_log = job_dir(name) / "worker-runtime.log"
     try:
         with open_log_for_append(runtime_log, create=True) as handle:
@@ -869,7 +1022,15 @@ def supervisor_main(name: str) -> int:
             finalize_delivery(name)
         return return_code or 0
 
-    terminate_process_group(record.get("child_identity"))
+    cancel_requested = bool(record.get("cancel_requested_at"))
+    cleanup_signal = terminate_process_group(
+        record.get("child_identity"),
+        record.get("child_process_group"),
+        grace_seconds=float(record.get("cancel_grace_seconds", 5.0)),
+    )
+    if cancel_requested and cleanup_signal is not None:
+        record_cancel_effective(name, cleanup_signal)
+        record = read_job(name)
     release_reserve(name)
     worker_signal = None
     worker_exit_code = return_code
@@ -886,6 +1047,17 @@ def supervisor_main(name: str) -> int:
     def worker_failed(current: dict[str, Any]) -> dict[str, Any]:
         reasons = list(current.get("failure_reasons", []))
         reasons.append(failure_reason)
+        if current.get("cancel_effective_at"):
+            current["worker_exit_code"] = worker_exit_code
+            current["worker_signal"] = worker_signal
+            return cancelled_terminal(
+                current,
+                exit_code=None,
+                signal_name=None,
+                marker_seen=False,
+                log_error=None,
+                failure_reasons=reasons,
+            )
         current.update(
             status="failed",
             completed_at=now_iso(),
@@ -896,6 +1068,7 @@ def supervisor_main(name: str) -> int:
             failure_reasons=reasons,
             child_pid=None,
             child_identity=None,
+            child_process_group=None,
         )
         return current
 
@@ -911,12 +1084,14 @@ def worker_main(name: str) -> int:
     def starting(record: dict[str, Any]) -> dict[str, Any]:
         if record["status"] != "queued":
             raise JobError(f"job is not queued: {name}")
-        record.update(
-            status="starting", started_at=now_iso(), worker_identity=worker_id
-        )
+        record.update(started_at=now_iso(), worker_identity=worker_id)
+        if not record.get("cancel_requested_at"):
+            record["status"] = "starting"
         return record
 
     record = update_job(name, starting)
+    if record.get("cancel_requested_at"):
+        return finalize_cancelled_before_launch(name)
     command = list(record["command"])
     log_path = Path(record["log"])
     marker = compile_success_pattern(record.get("success_pattern"))
@@ -926,9 +1101,21 @@ def worker_main(name: str) -> int:
     log_error: str | None = None
     logged_bytes = 0
     child: subprocess.Popen[bytes] | None = None
+    child_id: dict[str, Any] | None = None
+    child_group: dict[str, Any] | None = None
     return_code: int | None = None
+    cancel_effective = False
+    cancel_signal: str | None = None
+    cancel_deadline: float | None = None
 
     try:
+        test_start_delay = float(
+            os.environ.get("CODEX_LONG_JOBS_TEST_BEFORE_CHILD_START_SECONDS", "0")
+        )
+        if test_start_delay > 0:
+            time.sleep(test_start_delay)
+        if read_job(name).get("cancel_requested_at"):
+            return finalize_cancelled_before_launch(name)
         child = subprocess.Popen(
             command,
             cwd=record["cwd"],
@@ -939,30 +1126,81 @@ def worker_main(name: str) -> int:
             close_fds=True,
         )
         child_id = process_identity(child.pid)
+        child_group = process_group_identity(child.pid)
 
         def running(current: dict[str, Any]) -> dict[str, Any]:
             current.update(
-                status="running", child_identity=child_id, child_pid=child.pid
+                status="running",
+                child_identity=child_id,
+                child_process_group=child_group,
+                child_pid=child.pid,
             )
             return current
 
         update_job(name, running)
         assert child.stdout is not None
         read_chunk = getattr(child.stdout, "read1", child.stdout.read)
-        with open_log_for_append(log_path) as log_handle:
+        next_cancel_check = time.monotonic()
+        with (
+            open_log_for_append(log_path) as log_handle,
+            selectors.DefaultSelector() as selector,
+        ):
+            selector.register(child.stdout, selectors.EVENT_READ)
+            eof = False
             while True:
-                chunk = read_chunk(64 * 1024)
-                if not chunk:
+                now = time.monotonic()
+                timeout = max(0.0, next_cancel_check - now)
+                for _, _ in selector.select(timeout):
+                    chunk = read_chunk(64 * 1024)
+                    if not chunk:
+                        eof = True
+                        selector.unregister(child.stdout)
+                        child.poll()
+                        break
+                    text = decoder.decode(chunk)
+                    if marker and not marker_seen:
+                        marker_buffer = (marker_buffer + text)[
+                            -MAX_MARKER_BUFFER_BYTES:
+                        ]
+                        marker_seen = marker.search(marker_buffer) is not None
+                    if log_error is None:
+                        try:
+                            logged_bytes = write_log_chunk(
+                                log_handle, chunk, logged_bytes
+                            )
+                        except OSError as exc:
+                            log_error = f"{exc.__class__.__name__}: {exc}"
+
+                now = time.monotonic()
+                if now >= next_cancel_check:
+                    current = read_job(name)
+                    if (
+                        current.get("cancel_requested_at")
+                        and not cancel_effective
+                        and signal_process_group(child_group, signal.SIGTERM)
+                    ):
+                        cancel_effective = True
+                        cancel_signal = "SIGTERM"
+                        cancel_deadline = now + float(
+                            current.get("cancel_grace_seconds", 10.0)
+                        )
+                        record_cancel_effective(name, cancel_signal)
+                    if (
+                        cancel_effective
+                        and cancel_signal == "SIGTERM"
+                        and cancel_deadline is not None
+                        and now >= cancel_deadline
+                        and signal_process_group(child_group, signal.SIGKILL)
+                    ):
+                        cancel_signal = "SIGKILL"
+                        record_cancel_effective(name, cancel_signal)
+                    next_cancel_check = now + CANCEL_CHECK_INTERVAL_SECONDS
+                if (
+                    eof
+                    and child.poll() is not None
+                    and (not cancel_effective or not process_group_alive(child_group))
+                ):
                     break
-                text = decoder.decode(chunk)
-                if marker and not marker_seen:
-                    marker_buffer = (marker_buffer + text)[-MAX_MARKER_BUFFER_BYTES:]
-                    marker_seen = marker.search(marker_buffer) is not None
-                if log_error is None:
-                    try:
-                        logged_bytes = write_log_chunk(log_handle, chunk, logged_bytes)
-                    except OSError as exc:
-                        log_error = f"{exc.__class__.__name__}: {exc}"
             tail = decoder.decode(b"", final=True)
             if marker and not marker_seen and tail:
                 marker_seen = (
@@ -977,13 +1215,17 @@ def worker_main(name: str) -> int:
                 except OSError as exc:
                     log_error = f"{exc.__class__.__name__}: {exc}"
         return_code = child.wait()
+        test_terminal_delay = float(
+            os.environ.get("CODEX_LONG_JOBS_TEST_BEFORE_TERMINAL_SECONDS", "0")
+        )
+        if test_terminal_delay > 0:
+            time.sleep(test_terminal_delay)
     except BaseException as exc:
         if isinstance(exc, KeyboardInterrupt):
             raise
         log_error = log_error or f"worker error: {exc.__class__.__name__}: {exc}"
         if child is not None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(child.pid, signal.SIGTERM)
+            terminate_process_group(child_id, child_group)
             with contextlib.suppress(BaseException):
                 child.wait(timeout=5)
             return_code = child.returncode
@@ -1002,10 +1244,21 @@ def worker_main(name: str) -> int:
         reasons.append(f"command-exit={return_code}")
     if log_error:
         reasons.append(f"log-write-failed={log_error}")
-    if not marker_seen:
+    if not marker_seen and not cancel_effective:
         reasons.append("success-marker-missing")
 
     def terminal(current: dict[str, Any]) -> dict[str, Any]:
+        if cancel_effective or current.get("cancel_effective_at"):
+            if cancel_signal is not None:
+                current["cancel_signal"] = cancel_signal
+            return cancelled_terminal(
+                current,
+                exit_code=exit_code,
+                signal_name=signal_name,
+                marker_seen=marker_seen,
+                log_error=log_error,
+                failure_reasons=reasons,
+            )
         current.update(
             status="succeeded" if succeeded else "failed",
             completed_at=now_iso(),
@@ -1016,12 +1269,13 @@ def worker_main(name: str) -> int:
             failure_reasons=reasons,
             child_pid=None,
             child_identity=None,
+            child_process_group=None,
         )
         return current
 
-    update_job(name, terminal)
+    terminal_record = update_job(name, terminal)
     finalize_delivery(name)
-    return 0 if succeeded else 1
+    return 0 if terminal_record["status"] in {"succeeded", "cancelled"} else 1
 
 
 def choose_log_path(name: str, requested: str | None) -> Path:
@@ -1260,10 +1514,19 @@ def render_status(record: dict[str, Any]) -> str:
     ]
     if record.get("failure_reasons"):
         rows.append("failure_reasons=" + ";".join(record["failure_reasons"]))
+    if record.get("cancel_requested_at"):
+        rows.append(f"cancel_requested_at={record['cancel_requested_at']}")
+        rows.append(
+            f"cancel_effective_at={record.get('cancel_effective_at', 'not-effective')}"
+        )
+        rows.append(f"cancel_signal={record.get('cancel_signal', 'none')}")
+    if record.get("cancelled_at"):
+        rows.append(f"cancelled_at={record['cancelled_at']}")
     return "\n".join(rows)
 
 
 def command_status(args: argparse.Namespace) -> int:
+    errors: list[tuple[str, str]] = []
     if args.name:
         records = [read_job(validate_name(args.name))]
     else:
@@ -1273,8 +1536,10 @@ def command_status(args: argparse.Namespace) -> int:
             print("[]" if args.json else "")
             return 0
         for path in sorted(jobs_directory.glob("*/state.json")):
-            with contextlib.suppress(JobError, json.JSONDecodeError, OSError):
+            try:
                 records.append(read_job(path.parent.name))
+            except (JobError, json.JSONDecodeError, OSError) as exc:
+                errors.append((path.parent.name, f"{exc.__class__.__name__}: {exc}"))
     if args.json:
         print(
             json.dumps(
@@ -1285,7 +1550,62 @@ def command_status(args: argparse.Namespace) -> int:
         )
     else:
         print("\n\n".join(render_status(record) for record in records))
-    return 0
+    for name, error in errors:
+        print(f"codex-long-jobs: job={name} unreadable-state={error}", file=sys.stderr)
+    return 1 if errors else 0
+
+
+def command_cancel(args: argparse.Namespace) -> int:
+    name = validate_name(args.name)
+    grace_seconds = float(args.grace_seconds)
+    already_terminal = False
+    read_job(name)
+    with job_lock(name):
+        record = read_job(name)
+        if record["status"] in TERMINAL_STATUSES:
+            already_terminal = True
+        else:
+            if not supports_cancellation(record):
+                raise JobError(
+                    "cannot safely cancel a nonterminal job launched by a runtime older than 0.3.0"
+                )
+            if not record.get("cancel_requested_at"):
+                record["cancel_requested_at"] = now_iso()
+                record["cancel_grace_seconds"] = grace_seconds
+                record["updated_at"] = now_iso()
+                atomic_write_json(state_file(name), record)
+
+    if already_terminal:
+        print(f"job={name}")
+        print(f"status={record['status']}")
+        print("cancel=not-needed-already-terminal")
+        print(f"state={state_file(name)}")
+        return 0
+
+    deadline = (
+        time.monotonic()
+        + float(record.get("cancel_grace_seconds", grace_seconds))
+        + CANCEL_FINALIZE_WAIT_SECONDS
+        + CANCEL_CHECK_INTERVAL_SECONDS
+    )
+    while time.monotonic() < deadline:
+        record = read_job(name)
+        if record["status"] in TERMINAL_STATUSES:
+            print(f"job={name}")
+            print(f"status={record['status']}")
+            print(f"cancel_requested_at={record.get('cancel_requested_at')}")
+            print(
+                f"cancel_effective_at={record.get('cancel_effective_at', 'not-effective')}"
+            )
+            print(f"cancel_signal={record.get('cancel_signal', 'none')}")
+            print(f"state={state_file(name)}")
+            return 0
+        time.sleep(0.05)
+    raise JobError(
+        f"cancellation requested but job did not reach terminal state within "
+        f"{float(record.get('cancel_grace_seconds', grace_seconds)) + CANCEL_FINALIZE_WAIT_SECONDS:.1f} seconds; "
+        f"inspect {state_file(name)} and {record['log']}"
+    )
 
 
 def spawn_delivery(name: str) -> int:
@@ -1431,6 +1751,13 @@ def parser() -> argparse.ArgumentParser:
     status.add_argument("--name")
     status.add_argument("--json", action="store_true")
     status.set_defaults(func=command_status)
+
+    cancel = sub.add_parser(
+        "cancel", help="stop a nonterminal job and wait for durable final state"
+    )
+    cancel.add_argument("--name", required=True)
+    cancel.add_argument("--grace-seconds", type=nonnegative_float, default=10.0)
+    cancel.set_defaults(func=command_cancel)
 
     rebind = sub.add_parser(
         "rebind", help="bind pending jobs to the current resumed Codex TUI"

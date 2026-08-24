@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import errno
 import importlib.util
@@ -124,6 +125,32 @@ class HelperTests(unittest.TestCase):
         )
         self.assertTrue(RUNTIME.is_descendant(os.getpid(), os.getpid()))
         self.assertFalse(RUNTIME.is_descendant(os.getpid(), 999_999_999))
+
+    def test_stale_process_group_identity_is_never_signalled(self) -> None:
+        stale_group = {
+            "pgid": os.getpgrp(),
+            "session": os.getsid(0) + 999_999,
+            "leader": RUNTIME.process_identity(os.getpid()),
+        }
+        with mock.patch.object(RUNTIME.os, "killpg") as killpg:
+            self.assertFalse(
+                RUNTIME.signal_process_group(stale_group, RUNTIME.signal.SIGTERM)
+            )
+        killpg.assert_not_called()
+
+    def test_zombie_only_process_group_is_not_alive(self) -> None:
+        group = {"pgid": 123, "session": 123, "leader": None}
+        with (
+            mock.patch.object(
+                RUNTIME.Path, "iterdir", return_value=[Path("/proc/123")]
+            ),
+            mock.patch.object(
+                RUNTIME,
+                "linux_proc_stat_fields",
+                return_value=["Z", "1", "123", "123", *(["0"] * 16)],
+            ),
+        ):
+            self.assertFalse(RUNTIME.process_group_alive(group))
 
     def test_codex_ancestor_and_sandbox_walks_are_deterministic(self) -> None:
         process_tree = {
@@ -421,10 +448,46 @@ class HelperTests(unittest.TestCase):
         corrupt = self.state / "jobs" / "corrupt"
         corrupt.mkdir(mode=0o700)
         (corrupt / "state.json").write_text("not-json", encoding="utf-8")
+        self.write_record("healthy", status="succeeded")
         listing = io.StringIO()
-        with contextlib.redirect_stdout(listing):
-            self.assertEqual(RUNTIME.main(["status", "--json"]), 0)
-        self.assertEqual(json.loads(listing.getvalue()), [])
+        error = io.StringIO()
+        with contextlib.redirect_stdout(listing), contextlib.redirect_stderr(error):
+            self.assertEqual(RUNTIME.main(["status", "--json"]), 1)
+        self.assertEqual(
+            [record["name"] for record in json.loads(listing.getvalue())], ["healthy"]
+        )
+        self.assertIn("job=corrupt unreadable-state=JSONDecodeError", error.getvalue())
+
+    def test_cancel_parser_and_runtime_version_boundaries(self) -> None:
+        self.assertEqual(RUNTIME.nonnegative_float("0"), 0.0)
+        for invalid in ("-1", "nan", "inf", "-inf"):
+            with (
+                self.subTest(invalid=invalid),
+                self.assertRaises(argparse.ArgumentTypeError),
+            ):
+                RUNTIME.nonnegative_float(invalid)
+        self.assertEqual(RUNTIME.version_tuple("0.3.0"), (0, 3, 0))
+        self.assertIsNone(RUNTIME.version_tuple("development"))
+
+        current = self.write_record("current-runtime", status="running")
+        current["runtime_version"] = "0.3.0"
+        self.assertTrue(RUNTIME.supports_cancellation(current))
+        current["runtime_version"] = "0.2.0"
+        self.assertFalse(RUNTIME.supports_cancellation(current))
+
+        RUNTIME.atomic_write_json(RUNTIME.state_file("current-runtime"), current)
+        before = RUNTIME.state_file("current-runtime").read_bytes()
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            self.assertEqual(RUNTIME.main(["cancel", "--name", "current-runtime"]), 1)
+        self.assertIn("runtime older than 0.3.0", error.getvalue())
+        self.assertEqual(RUNTIME.state_file("current-runtime").read_bytes(), before)
+
+    def test_cancelled_completion_prompt_names_the_terminal_state(self) -> None:
+        record = self.write_record("cancelled-prompt", status="cancelled")
+        prompt = RUNTIME.completion_prompt(record)
+        self.assertIn("was cancelled", prompt)
+        self.assertNotIn("failed", prompt)
 
     def test_retry_delivery_terminal_and_nonterminal_boundaries(self) -> None:
         self.write_record(

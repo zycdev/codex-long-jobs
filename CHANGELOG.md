@@ -5,6 +5,29 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-24
+
+### Added
+
+- Add durable `cancel` requests with synchronous terminal-state confirmation.
+- Stop the validated child process group with `SIGTERM` and bounded `SIGKILL`
+  escalation, including worker-loss and supervisor-loss handling.
+- Persist `cancelled` terminal state, request and effectiveness timestamps,
+  applied signal, command result, and normal completion delivery.
+- Cover prelaunch cancellation, descendant cleanup, escalation, duplicate
+  cancellation, delivery, and natural-completion races in the automated suite.
+
+### Changed
+
+- Report unreadable job records during unfiltered `status` listings instead of
+  silently omitting them.
+- Preserve unknown job names after a failed cancellation request and restore
+  process cleanup when group-identity capture fails.
+- Reduce Linux process-group validation from full process metadata reads to
+  lightweight `/proc/PID/stat` checks.
+- Keep `status --json` as the stable machine-readable lifecycle and result
+  interface rather than adding a redundant `result` command.
+
 ### Documentation
 
 - Clarify repository and skill metadata around Codex background jobs, detached
@@ -56,6 +79,7 @@ versions follow [Semantic Versioning](https://semver.org/).
 - Reproducible CI across Python 3.10, 3.13, and 3.14.
 - Standard user installation under `~/.agents/skills`.
 
-[Unreleased]: https://github.com/zycdev/codex-long-jobs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/zycdev/codex-long-jobs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/zycdev/codex-long-jobs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zycdev/codex-long-jobs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/zycdev/codex-long-jobs/releases/tag/v0.1.0

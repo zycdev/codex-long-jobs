@@ -74,7 +74,7 @@ class RuntimeTests(unittest.TestCase):
         while time.monotonic() < deadline:
             if path.exists():
                 record = json.loads(path.read_text(encoding="utf-8"))
-                if record["status"] in {"succeeded", "failed"}:
+                if record["status"] in {"succeeded", "failed", "cancelled"}:
                     return record
             time.sleep(0.05)
         self.fail(f"job did not become terminal: {name}")
@@ -125,6 +125,36 @@ class RuntimeTests(unittest.TestCase):
             env=env,
         )
         return self.wait_terminal(name)
+
+    def launch_running(
+        self,
+        name: str,
+        code: str,
+        *,
+        env: dict[str, str] | None = None,
+        delivery: str = "event-only",
+        wait_for: set[str] | None = None,
+    ) -> dict:
+        log = self.root / f"{name}.log"
+        self.cli(
+            "start",
+            "--name",
+            name,
+            "--log",
+            str(log),
+            "--success-pattern",
+            "^DONE$",
+            "--delivery",
+            delivery,
+            "--viewer",
+            "none",
+            "--",
+            sys.executable,
+            "-c",
+            code,
+            env=env,
+        )
+        return self.wait_status(name, wait_for or {"running"})
 
     def test_success_and_nonzero_failure_are_persisted(self) -> None:
         success = self.start("success", "print('setup output\\nDONE')")
@@ -180,6 +210,241 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNone(signaled["exit_code"])
         self.assertEqual(signaled["signal"], "SIGTERM")
         self.assertIn("command-signal=SIGTERM", signaled["failure_reasons"])
+
+    def test_cancel_stops_the_recorded_process_group_and_is_idempotent(self) -> None:
+        grandchild_file = self.root / "cancel-grandchild.pid"
+        code = (
+            "import pathlib, subprocess, sys, time; "
+            f"p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"pathlib.Path({str(grandchild_file)!r}).write_text(str(p.pid)); "
+            "print('READY', flush=True); time.sleep(30)"
+        )
+        running = self.launch_running("cancel-group", code)
+        child_pid = int(running["child_pid"])
+        deadline = time.monotonic() + 3
+        while not grandchild_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        grandchild_pid = int(grandchild_file.read_text(encoding="utf-8"))
+
+        cancelled = self.cli(
+            "cancel", "--name", "cancel-group", "--grace-seconds", "0.5"
+        )
+        self.assertIn("status=cancelled", cancelled.stdout)
+        record = self.wait_terminal("cancel-group")
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["signal"], "SIGTERM")
+        self.assertEqual(record["cancel_signal"], "SIGTERM")
+        self.assertIn("cancel_requested_at", record)
+        self.assertIn("cancel_effective_at", record)
+        self.assertIn("cancelled_at", record)
+        for pid in (child_pid, grandchild_pid):
+            deadline = time.monotonic() + 3
+            while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(Path(f"/proc/{pid}").exists())
+
+        before = (self.state / "jobs" / "cancel-group" / "state.json").read_bytes()
+        repeated = self.cli("cancel", "--name", "cancel-group")
+        after = (self.state / "jobs" / "cancel-group" / "state.json").read_bytes()
+        self.assertIn("cancel=not-needed-already-terminal", repeated.stdout)
+        self.assertEqual(after, before)
+
+    def test_cancel_unknown_name_does_not_consume_the_name(self) -> None:
+        unknown = self.cli("cancel", "--name", "cancel-typo", check=False)
+        self.assertEqual(unknown.returncode, 1)
+        self.assertIn("unknown job: cancel-typo", unknown.stderr)
+        self.assertFalse((self.state / "jobs" / "cancel-typo").exists())
+
+        record = self.start("cancel-typo", "print('DONE')")
+        self.assertEqual(record["status"], "succeeded")
+
+    def test_cancel_escalates_when_the_process_group_ignores_sigterm(self) -> None:
+        code = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('READY', flush=True); time.sleep(30)"
+        )
+        self.launch_running("cancel-kill", code)
+        log = self.root / "cancel-kill.log"
+        deadline = time.monotonic() + 3
+        while (
+            not log.exists() or "READY" not in log.read_text(encoding="utf-8")
+        ) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        result = self.cli("cancel", "--name", "cancel-kill", "--grace-seconds", "0.2")
+        self.assertIn("status=cancelled", result.stdout)
+        record = self.wait_terminal("cancel-kill")
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["signal"], "SIGKILL")
+        self.assertEqual(record["cancel_signal"], "SIGKILL")
+
+    def test_cancel_escalates_after_parent_exit_and_log_eof(self) -> None:
+        grandchild_file = self.root / "cancel-eof-grandchild.pid"
+        code = (
+            "import pathlib, subprocess, sys, time; "
+            "child_code='import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'; "
+            "p=subprocess.Popen([sys.executable, '-c', child_code], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+            f"pathlib.Path({str(grandchild_file)!r}).write_text(str(p.pid)); "
+            "print('READY', flush=True); time.sleep(30)"
+        )
+        self.launch_running("cancel-after-eof", code)
+        deadline = time.monotonic() + 3
+        while not grandchild_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        grandchild_pid = int(grandchild_file.read_text(encoding="utf-8"))
+
+        result = self.cli(
+            "cancel", "--name", "cancel-after-eof", "--grace-seconds", "0.2"
+        )
+        self.assertIn("status=cancelled", result.stdout)
+        record = self.wait_terminal("cancel-after-eof")
+        self.assertEqual(record["cancel_signal"], "SIGKILL")
+        deadline = time.monotonic() + 3
+        while Path(f"/proc/{grandchild_pid}").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(Path(f"/proc/{grandchild_pid}").exists())
+
+    def test_cancel_is_observed_after_command_closes_its_log_pipe(self) -> None:
+        code = "import os, time; os.close(1); os.close(2); time.sleep(30)"
+        running = self.launch_running("cancel-after-log-close", code)
+        child_pid = int(running["child_pid"])
+        time.sleep(0.2)
+
+        result = self.cli(
+            "cancel", "--name", "cancel-after-log-close", "--grace-seconds", "0.2"
+        )
+        self.assertIn("status=cancelled", result.stdout)
+        record = self.wait_terminal("cancel-after-log-close")
+        self.assertEqual(record["cancel_signal"], "SIGTERM")
+        self.assertFalse(Path(f"/proc/{child_pid}").exists())
+
+    def test_cancel_stops_live_descendant_after_parent_exits(self) -> None:
+        grandchild_file = self.root / "cancel-after-parent-grandchild.pid"
+        code = (
+            "import pathlib, subprocess, sys; "
+            "p=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"pathlib.Path({str(grandchild_file)!r}).write_text(str(p.pid)); "
+            "print('PARENT_DONE', flush=True)"
+        )
+        self.launch_running("cancel-after-parent", code)
+        deadline = time.monotonic() + 3
+        while not grandchild_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        grandchild_pid = int(grandchild_file.read_text(encoding="utf-8"))
+        time.sleep(0.2)
+
+        result = self.cli(
+            "cancel", "--name", "cancel-after-parent", "--grace-seconds", "0.2"
+        )
+        self.assertIn("status=cancelled", result.stdout)
+        record = self.wait_terminal("cancel-after-parent")
+        self.assertEqual(record["cancel_signal"], "SIGTERM")
+        deadline = time.monotonic() + 3
+        while Path(f"/proc/{grandchild_pid}").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(Path(f"/proc/{grandchild_pid}").exists())
+
+    def test_cancel_before_child_launch_suppresses_the_command(self) -> None:
+        artifact = self.root / "should-not-run"
+        env = self.env.copy()
+        env["CODEX_LONG_JOBS_TEST_BEFORE_CHILD_START_SECONDS"] = "1"
+        self.launch_running(
+            "cancel-starting",
+            f"from pathlib import Path; Path({str(artifact)!r}).touch(); print('DONE')",
+            env=env,
+            wait_for={"starting"},
+        )
+        result = self.cli(
+            "cancel",
+            "--name",
+            "cancel-starting",
+            "--grace-seconds",
+            "0.2",
+            env=env,
+        )
+        self.assertIn("status=cancelled", result.stdout)
+        record = self.wait_terminal("cancel-starting")
+        self.assertEqual(record["status"], "cancelled")
+        self.assertNotIn("cancel_signal", record)
+        self.assertFalse(artifact.exists())
+
+    def test_natural_completion_wins_when_cancel_signal_was_not_effective(self) -> None:
+        env = self.env.copy()
+        env["CODEX_LONG_JOBS_TEST_BEFORE_TERMINAL_SECONDS"] = "1"
+        self.launch_running("cancel-race-success", "print('DONE')", env=env)
+        result = self.cli(
+            "cancel",
+            "--name",
+            "cancel-race-success",
+            "--grace-seconds",
+            "0.2",
+            env=env,
+        )
+        self.assertIn("status=succeeded", result.stdout)
+        record = self.wait_terminal("cancel-race-success")
+        self.assertEqual(record["status"], "succeeded")
+        self.assertIn("cancel_requested_at", record)
+        self.assertNotIn("cancel_effective_at", record)
+
+    def test_cancel_still_works_after_supervisor_sigkill(self) -> None:
+        running = self.launch_running(
+            "cancel-without-supervisor", "import time; time.sleep(30)"
+        )
+        supervisor_pid = int(running["supervisor_identity"]["pid"])
+        os.kill(supervisor_pid, signal.SIGKILL)
+        result = self.cli(
+            "cancel",
+            "--name",
+            "cancel-without-supervisor",
+            "--grace-seconds",
+            "0.2",
+        )
+        self.assertIn("status=cancelled", result.stdout)
+        record = self.wait_terminal("cancel-without-supervisor")
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["cancel_signal"], "SIGTERM")
+
+    def test_supervisor_finalizes_cancel_if_worker_dies_during_request(self) -> None:
+        code = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('READY', flush=True); time.sleep(30)"
+        )
+        running = self.launch_running("cancel-worker-dies", code)
+        worker_pid = int(running["worker_identity"]["pid"])
+        cancel = subprocess.Popen(
+            [
+                sys.executable,
+                str(CLI),
+                "cancel",
+                "--name",
+                "cancel-worker-dies",
+                "--grace-seconds",
+                "0.2",
+            ],
+            env=self.env,
+            cwd=self.root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.wait_status("cancel-worker-dies", {"running"})
+        deadline = time.monotonic() + 3
+        state_path = self.state / "jobs" / "cancel-worker-dies" / "state.json"
+        while time.monotonic() < deadline:
+            current = json.loads(state_path.read_text(encoding="utf-8"))
+            if current.get("cancel_requested_at"):
+                break
+            time.sleep(0.02)
+        os.kill(worker_pid, signal.SIGKILL)
+        stdout, stderr = cancel.communicate(timeout=8)
+        self.assertEqual(cancel.returncode, 0, stdout + stderr)
+        record = self.wait_terminal("cancel-worker-dies", timeout=10)
+        self.assertEqual(record["status"], "cancelled")
+        self.assertEqual(record["worker_signal"], "SIGKILL")
+        self.assertIn("worker-signal=SIGKILL", record["failure_reasons"])
 
     def test_missing_executable_becomes_terminal_failure(self) -> None:
         log = self.root / "missing-executable.log"
@@ -672,6 +937,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(record["delivery"]["status"], "delivered")
         self.assertEqual((fake_root / "paste_count").read_text(encoding="utf-8"), "1")
         self.assertEqual((fake_root / "enter_count").read_text(encoding="utf-8"), "2")
+
+    def test_cancelled_job_delivers_one_cancelled_completion_prompt(self) -> None:
+        thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
+        endpoint, env, fake_root = self.fake_endpoint(thread)
+        (fake_root / "mode").write_text("idle", encoding="utf-8")
+        (fake_root / "fail_enter_count").write_text("0", encoding="utf-8")
+        state_path = self.write_terminal_job("cancel-delivery", endpoint, thread)
+        record = json.loads(state_path.read_text(encoding="utf-8"))
+        record["status"] = "cancelled"
+        record["cancel_requested_at"] = "test"
+        record["cancel_effective_at"] = "test"
+        record["cancelled_at"] = "test"
+        state_path.write_text(json.dumps(record), encoding="utf-8")
+
+        self.cli("_deliver", "--name", "cancel-delivery", env=env)
+        delivered = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(delivered["delivery"]["status"], "delivered")
+        self.assertEqual((fake_root / "paste_count").read_text(encoding="utf-8"), "1")
+        prompt = (fake_root / "buffer").read_text(encoding="utf-8")
+        self.assertIn("was cancelled", prompt)
 
     def test_concurrent_job_deliveries_are_serialized(self) -> None:
         thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"

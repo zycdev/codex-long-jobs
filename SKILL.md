@@ -1,6 +1,6 @@
 ---
 name: codex-long-jobs
-description: Run long-running, background, async, or detached processes from OpenAI Codex CLI and wake or resume the owning Codex session on process completion, without LLM/model polling while the job runs. Use when asked to run something in the background, start a long build, test, training job, or evaluation, not poll it, wait without wasting model turns, continue when it finishes, wake the original session, preserve logs and exit state, survive Codex or tmux viewer exit, or rebind after the original Codex thread restarts.
+description: Run, supervise, or explicitly cancel long-running, background, async, or detached processes from OpenAI Codex CLI and wake or resume the owning Codex session on process completion, without LLM/model polling while the job runs. Use when asked to run something in the background, start or stop a long build, test, training job, or evaluation, not poll it, wait without wasting model turns, continue when it finishes, wake the original session, preserve logs and exit state, survive Codex or tmux viewer exit, cancel the complete job process group, or rebind after the original Codex thread restarts.
 ---
 
 # Codex Long Jobs
@@ -45,6 +45,33 @@ and viewer attach command. Verify the job reaches `running` once, then end the
 turn. Do not spend model turns polling. The local worker waits for process exit,
 and the detached supervisor converts unexpected worker exit into durable
 failure and delivery.
+
+## Cancel only when explicitly requested
+
+Do not stop a healthy job unless the user explicitly requests cancellation or
+the already-authorized workflow makes stopping it necessary. Use the controller
+instead of manually killing a PID:
+
+```bash
+"$SKILL_ROOT/scripts/codex-long-jobs" cancel --name <name>
+```
+
+Run cancellation with scoped host permission for the configured state
+directory. The command records the request, releases its state lock, and waits
+for a durable terminal result. The worker sends `SIGTERM` to the validated child
+process group, waits 10 seconds by default, and escalates to `SIGKILL` if needed.
+Use `--grace-seconds SECONDS` only when a different shutdown interval is
+appropriate.
+
+An effective request becomes `cancelled` and uses normal completion delivery.
+If the command naturally completed before any signal took effect, its actual
+`succeeded` or `failed` result wins. Inspect the returned state and log before
+reporting the outcome. Repeating `cancel` on a terminal job is safe and does not
+rewrite its state.
+
+Treat a zero controller exit as confirmation that some durable terminal state
+was reached. Check `status` and `cancel_effective_at`; zero does not by itself
+mean the cancellation signal took effect.
 
 ## Choose delivery behavior
 

@@ -4,6 +4,7 @@
 
 - Runtime architecture
 - Terminal-state rules
+- Cancellation state machine
 - TUI delivery state machine
 - Session exit and resume
 - tmux failure behavior
@@ -16,9 +17,9 @@
 `start` launches a detached Python supervisor with a new OS session and closed
 interactive stdin. The supervisor launches and waits for the worker. The worker
 launches the requested command in another process group, streams combined
-stdout and stderr to the configured log, records terminal state atomically, and
-then invokes the delivery layer. No model call or Codex turn occurs while the
-command is merely running.
+stdout and stderr to the configured log, checks durable cancellation state,
+records terminal state atomically, and then invokes the delivery layer. No
+model call or Codex turn occurs while the command is merely running.
 
 If the worker exits before terminal state, the supervisor terminates the
 validated child process group, records `worker-exit` or `worker-signal`, and
@@ -61,6 +62,50 @@ releases that file before writing final state, improving the chance that a
 full state filesystem can still record the small terminal record. Keep large
 logs and training artifacts on a filesystem with adequate headroom; the reserve
 is not a substitute for capacity planning.
+
+## Cancellation state machine
+
+`cancel --name NAME` writes a durable `cancel_requested_at` value under the job
+lock, releases that lock, and waits synchronously for any durable terminal
+state. It never holds the lock while waiting because the worker or supervisor
+must acquire the same lock to finalize the record.
+
+For a running command, the worker validates the recorded child process group,
+sends `SIGTERM`, records `cancel_effective_at` and `cancel_signal`, and waits for
+the configured grace period. If any member remains, it sends `SIGKILL`. The
+terminal record uses status `cancelled`, retains the command exit code or signal
+when available, records `cancelled_at`, clears live child identities, and uses
+the same completion delivery path as success and failure.
+
+The controller is idempotent for terminal jobs and leaves their state bytes
+unchanged. A duplicate request while the job is active reuses the first request
+and grace period. If the process has already completed and no cancellation
+signal becomes effective, the actual `succeeded` or `failed` result wins. A
+request made before child launch suppresses launch and finalizes as
+`cancelled`.
+
+If the main command exits zero while a same-group descendant remains alive, a
+later request can still signal that descendant and produce `cancelled` with
+`exit_code: 0`. Consumers must use `status` and `cancel_effective_at`, not the
+numeric exit code alone, to interpret cancellation. Likewise, controller exit
+status zero means a durable terminal state was observed; it does not guarantee
+that cancellation beat natural completion.
+
+Cancellation remains worker-owned when the supervisor alone has exited. If the
+worker dies after a request, the supervisor terminates the same validated
+process group and finalizes `cancelled` when a signal became effective. The CLI
+returns an error if no terminal state appears within the grace period plus a
+bounded finalization allowance.
+
+Only jobs created by runtime version 0.3.0 or newer have the process-group and
+cancellation contract required by this command. The controller refuses to
+cancel an older nonterminal record. Use its original runtime or inspect and
+stop that workload manually.
+
+The boundary is one OS process group inside the recorded session. A descendant
+that deliberately calls `setsid`, submits work to a scheduler, or launches a
+container can escape that boundary and requires its native cancellation
+mechanism.
 
 ## TUI delivery state machine
 
@@ -134,6 +179,8 @@ for workloads requiring host-crash recovery.
   already authorized in the owning conversation.
 - Process identity includes start time and executable, preventing a reused PID
   from being treated as the original worker or TUI.
+- Cancellation validates both process-group and OS-session identity before
+  signaling, reducing stale process-group reuse risk.
 - Desktop notices contain only job name, terminal status, and exit code.
 
 ## Known limitations
@@ -142,10 +189,18 @@ for workloads requiring host-crash recovery.
   native Windows is unsupported.
 - Python 3.10 or newer is required. tmux is optional for execution but required
   for direct Codex CLI TUI delivery and the visual log viewer.
+- Linux validates surviving process-group members against both group and
+  session identity. The non-Linux fallback can validate only the original group
+  leader, so cancellation after that leader exits is not guaranteed there.
 - Direct TUI delivery uses conservative tmux input injection because Codex CLI
   does not yet expose a stable public idle-wake API for arbitrary local tools.
 - The supervisor and worker survive tmux failure, not machine reboot. Jobs are
   host-local.
 - A running worker survives supervisor-only loss, but there is no automatic
   supervisor replacement.
+- After `SIGKILL`, the worker keeps a nonterminal record while any non-zombie
+  group member remains. An uninterruptible process can therefore outlive the
+  CLI cancellation timeout instead of being falsely reported as stopped.
+- A queued job whose supervisor dies before it starts a worker remains stranded
+  and needs manual host inspection; no live component can observe its request.
 - State reports process completion, not semantic correctness; verify artifacts.
