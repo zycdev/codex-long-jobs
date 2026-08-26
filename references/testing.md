@@ -32,6 +32,8 @@ version from 3.10 through 3.14. The current suite covers:
 10. Desktop notification minimization, completion path escaping, corrupt-state
     reporting, status JSON, doctor output, log tailing, version consistency, and
     viewer-name uniqueness.
+11. Release installation dry runs, fixed-commit worktrees, safe destination
+    replacement, upgrades, private receipts, and drift detection.
 
 The coverage harness uses coverage.py subprocess instrumentation because the
 runtime deliberately creates detached Python processes. CI requires at least
@@ -61,8 +63,8 @@ scripts/stress_test.sh 10
 Lint all Python and shell entrypoints:
 
 ```bash
-ruff check scripts/codex_long_jobs.py tests
-ruff format --check scripts/codex_long_jobs.py tests
+ruff check scripts/*.py tests
+ruff format --check scripts/*.py tests
 shellcheck scripts/codex-long-jobs scripts/*.sh
 ```
 

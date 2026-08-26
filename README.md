@@ -183,19 +183,26 @@ tell me when it is ready.
 ```
 
 After Codex completes the installation, the new skill is available on the next
-turn. To install manually instead, clone the repository into a Codex skills
-directory:
+turn. Contributors and other users who keep a working clone should install a
+fixed release worktree instead of linking Codex directly to the active checkout:
 
 ```bash
-mkdir -p "$HOME/.agents/skills"
 git clone https://github.com/zycdev/codex-long-jobs.git \
-  "$HOME/.agents/skills/codex-long-jobs"
+  "$HOME/workspaces/codex-long-jobs"
+cd "$HOME/workspaces/codex-long-jobs"
+python scripts/install_skill.py install             # dry run
+python scripts/install_skill.py install --yes       # link the local main commit
+python scripts/install_skill.py verify
 ```
 
-Restart Codex, then confirm the skill appears in `/skills`. The repository
-contains the discoverable [`SKILL.md`](SKILL.md), the controller, tests, and
-operational references. Private job state defaults to
-`${CODEX_HOME:-$HOME/.codex}/long-jobs`.
+The installer is offline. It creates a detached worktree under
+`${XDG_STATE_HOME:-$HOME/.local/state}/codex-long-jobs/release`, records the
+resolved commit, and links `${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs`
+to it. Development changes do not affect the installed skill until the installer
+is run again. Use `--ref TAG_OR_COMMIT` to pin or roll back explicitly.
+
+Restart Codex, then confirm the skill appears in `/skills`.
+Private job state defaults to `${CODEX_HOME:-$HOME/.codex}/long-jobs`.
 
 ## Codex CLI example: run deep learning model training in the background
 
@@ -210,7 +217,7 @@ session when it finishes and verify the checkpoint.
 The corresponding controller command can look like this:
 
 ```bash
-SKILL_ROOT="$HOME/.agents/skills/codex-long-jobs"
+SKILL_ROOT="${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs"
 
 "$SKILL_ROOT/scripts/codex-long-jobs" start \
   --name train-model-run-01 \

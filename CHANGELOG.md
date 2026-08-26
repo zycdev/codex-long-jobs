@@ -5,6 +5,11 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Add an offline release-worktree installer so contributors can run a fixed
+  local commit while continuing development in the primary checkout.
+
 ## [0.3.0] - 2026-08-24
 
 ### Added
