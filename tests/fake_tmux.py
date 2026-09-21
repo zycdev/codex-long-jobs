@@ -35,9 +35,23 @@ def increment(name: str) -> int:
         return value
 
 
+def render_composer(prompt: str) -> str:
+    width_text = read("composer_wrap_width").strip()
+    if not width_text:
+        return prompt
+    width = int(width_text)
+    indent = read("composer_wrap_indent", "  ")
+    lines = [prompt[:width]]
+    remaining = prompt[width:]
+    while remaining:
+        lines.append(f"{indent}{remaining[:width]}")
+        remaining = remaining[width:]
+    return "\n".join(lines)
+
+
 def screen(escaped: bool) -> str:
     mode = read("mode", "idle").strip()
-    prompt = read("buffer")
+    prompt = render_composer(read("buffer"))
     if escaped:
         if mode == "pasted":
             return f"\x1b[1m›\x1b[0m {prompt}\n"

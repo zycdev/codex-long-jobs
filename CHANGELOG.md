@@ -5,10 +5,18 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-21
+
 ### Added
 
 - Add an offline release-worktree installer so contributors can run a fixed
   local commit while continuing development in the primary checkout.
+
+### Fixed
+
+- Recognize unique completion tokens that the Codex TUI renders across
+  multiple composer lines, both before the first Enter and during missed-Enter
+  retries, without pasting the prompt again.
 
 ## [0.3.0] - 2026-08-24
 
@@ -84,7 +92,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 - Reproducible CI across Python 3.10, 3.13, and 3.14.
 - Standard user installation under `~/.agents/skills`.
 
-[Unreleased]: https://github.com/zycdev/codex-long-jobs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/zycdev/codex-long-jobs/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/zycdev/codex-long-jobs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/zycdev/codex-long-jobs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/zycdev/codex-long-jobs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/zycdev/codex-long-jobs/releases/tag/v0.1.0

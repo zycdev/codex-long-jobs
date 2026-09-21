@@ -21,7 +21,7 @@ its tmux-hosted Codex TUI.
 - Durable job state, logs, exit code, signal, and delivery status.
 - An optional tmux log viewer that never owns the supervised process.
 
-> Status: `v0.3.0` beta. Linux is the primary tested platform. Python 3.10 or
+> Status: `v0.3.1` beta. Linux is the primary tested platform. Python 3.10 or
 > newer is required.
 
 ## Why codex-long-jobs? Run long-running processes without model polling

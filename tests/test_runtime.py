@@ -938,6 +938,46 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual((fake_root / "paste_count").read_text(encoding="utf-8"), "1")
         self.assertEqual((fake_root / "enter_count").read_text(encoding="utf-8"), "2")
 
+    def test_wrapped_legacy_token_is_submitted_once(self) -> None:
+        thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
+        endpoint, env, fake_root = self.fake_endpoint(thread)
+        (fake_root / "mode").write_text("idle", encoding="utf-8")
+        (fake_root / "fail_enter_count").write_text("0", encoding="utf-8")
+        (fake_root / "composer_wrap_width").write_text("37", encoding="utf-8")
+        name = "legacy-long-token-delivery-compatibility"
+        state_path = self.write_terminal_job(name, endpoint, thread)
+
+        self.cli("_deliver", "--name", name, env=env)
+
+        record = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["delivery"]["status"], "delivered")
+        self.assertEqual(
+            record["delivery"]["reason"], "submitted-after-1-enter-attempts"
+        )
+        self.assertEqual((fake_root / "paste_count").read_text(encoding="utf-8"), "1")
+        self.assertEqual((fake_root / "enter_count").read_text(encoding="utf-8"), "1")
+        self.assertTrue(record["delivery"]["token"].startswith("[codex-long-jobs:"))
+
+    def test_wrapped_legacy_token_retries_missed_enter_without_repasting(
+        self,
+    ) -> None:
+        thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
+        endpoint, env, fake_root = self.fake_endpoint(thread)
+        (fake_root / "mode").write_text("idle", encoding="utf-8")
+        (fake_root / "composer_wrap_width").write_text("29", encoding="utf-8")
+        name = "legacy-wrapped-token-missed-enter-retry"
+        state_path = self.write_terminal_job(name, endpoint, thread)
+
+        self.cli("_deliver", "--name", name, env=env)
+
+        record = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["delivery"]["status"], "delivered")
+        self.assertEqual(
+            record["delivery"]["reason"], "submitted-after-2-enter-attempts"
+        )
+        self.assertEqual((fake_root / "paste_count").read_text(encoding="utf-8"), "1")
+        self.assertEqual((fake_root / "enter_count").read_text(encoding="utf-8"), "2")
+
     def test_cancelled_job_delivers_one_cancelled_completion_prompt(self) -> None:
         thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
         endpoint, env, fake_root = self.fake_endpoint(thread)

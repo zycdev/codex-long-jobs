@@ -32,7 +32,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 SCHEMA_VERSION = 1
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 THREAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,160}$")
@@ -635,6 +635,16 @@ def screen_is_busy(plain_screen: str) -> bool:
     return any(marker in lowered for marker in BUSY_MARKERS)
 
 
+def delivery_token_is_visible(plain_screen: str, token: str) -> bool:
+    if not token:
+        return False
+    if token in plain_screen:
+        return True
+    visual_line_break = r"(?:[ \t]*\r?\n[ \t]*)?"
+    wrapped_token = visual_line_break.join(re.escape(character) for character in token)
+    return re.search(wrapped_token, plain_screen) is not None
+
+
 def set_delivery(name: str, status: str, reason: str, **extra: Any) -> dict[str, Any]:
     def change(record: dict[str, Any]) -> dict[str, Any]:
         delivery = dict(record.get("delivery", {}))
@@ -693,7 +703,7 @@ def try_tui_submission(
     visible = False
     for _ in range(20):
         try:
-            if token in tmux_capture(endpoint, escaped=False):
+            if delivery_token_is_visible(tmux_capture(endpoint, escaped=False), token):
                 visible = True
                 break
         except subprocess.SubprocessError:
@@ -702,9 +712,10 @@ def try_tui_submission(
     if not visible:
         return False, "prompt-not-visible-after-paste"
 
-    # Retry Enter only while the exact freshly pasted token is still visible
-    # and the TUI has not become busy.  This addresses a missed key event
-    # without creating a second prompt or relying on Codex's queue shortcut.
+    # Retry Enter only while the freshly pasted token is still visible and the
+    # TUI has not become busy. The token may span rendered composer lines.
+    # This addresses a missed key event without creating a second prompt or
+    # relying on Codex's queue shortcut.
     for attempt in range(1, 5):
         sent = tmux_call(socket, ["send-keys", "-t", pane, "Enter"], check=False)
         time.sleep(0.25 * attempt)
@@ -715,7 +726,7 @@ def try_tui_submission(
             return False, "pane-lost-after-submit"
         if composer_is_empty(escaped) or screen_is_busy(plain):
             return True, f"submitted-after-{attempt}-enter-attempts"
-        if token not in plain:
+        if not delivery_token_is_visible(plain, token):
             return False, "submission-uncertain-token-disappeared"
         if sent.returncode != 0 and attempt == 4:
             return False, "enter-key-failed"

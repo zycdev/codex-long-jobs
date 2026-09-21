@@ -23,7 +23,8 @@ version from 3.10 through 3.14. The current suite covers:
 4. Exact argv boundaries for spaces, shell-like text, and embedded newlines.
 5. Concurrent duplicate starts and cross-job TUI delivery serialization.
 6. Busy TUI deferral, empty-composer validation, missed Enter retry, persistent
-   Enter failure, delivery timeout, retry, and thread-isolated rebind.
+   Enter failure, completion tokens wrapped across indented composer lines,
+   delivery timeout, retry, and thread-isolated rebind.
 7. Disposable tmux viewer failure and recreation behavior.
 8. Event-only, direct TUI, and explicitly selected headless delivery paths.
 9. Cancellation before launch, process-group termination, `SIGTERM` to

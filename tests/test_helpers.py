@@ -489,6 +489,34 @@ class HelperTests(unittest.TestCase):
         self.assertIn("was cancelled", prompt)
         self.assertNotIn("failed", prompt)
 
+    def test_delivery_token_visibility_allows_only_tui_line_wrapping(self) -> None:
+        token = "[codex-long-jobs:legacy-long-job-name:0123456789ab]"
+        self.assertTrue(RUNTIME.delivery_token_is_visible(f"> {token}\n", token))
+        self.assertTrue(
+            RUNTIME.delivery_token_is_visible(
+                "› [codex-long-jobs:legacy-long-\n  job-name:0123456789ab]\n",
+                token,
+            )
+        )
+        self.assertTrue(
+            RUNTIME.delivery_token_is_visible(
+                "› [codex-long-jobs:legacy- \n    long-job-name:012345\n  6789ab]\n",
+                token,
+            )
+        )
+        self.assertFalse(
+            RUNTIME.delivery_token_is_visible(
+                "› [codex-long-jobs:another-job:0123456789ab]\n",
+                token,
+            )
+        )
+        self.assertFalse(
+            RUNTIME.delivery_token_is_visible(
+                "› [codex-long-jobs:legacy-long-\n  unrelated job-name:0123456789ab]\n",
+                token,
+            )
+        )
+
     def test_retry_delivery_terminal_and_nonterminal_boundaries(self) -> None:
         self.write_record(
             "already-delivered",

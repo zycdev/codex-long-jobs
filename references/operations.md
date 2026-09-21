@@ -120,9 +120,12 @@ TUI delivery validates all of the following before input injection:
 If the TUI is busy, the delivery worker waits locally. It does not paste into
 the composer and does not use `Tab` to queue a follow-up. Once idle, it pastes
 one prompt through a named tmux buffer. If the first `Enter` is missed while
-the same unique token remains visible, it retries only the key event; it never
-pastes a second prompt. An ambiguous state remains durably pending for manual
-inspection instead of risking duplicate delivery.
+the same unique token remains visible, including when the TUI renders that
+token across indented visual lines, it retries only the key event; it never
+pastes a second prompt. The visibility check tolerates only rendered line
+breaks and their horizontal indentation inside the exact token. An ambiguous
+state remains durably pending for manual inspection instead of risking
+duplicate delivery.
 
 A state-root lock serializes the validation and submission boundary across all
 jobs. Two jobs that complete together cannot both observe and paste into the
