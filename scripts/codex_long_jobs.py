@@ -32,17 +32,19 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 SCHEMA_VERSION = 1
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 THREAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,160}$")
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
-DELIVERY_DONE = {"delivered", "disabled", "headless-dispatched"}
+DELIVERY_DONE = {"queued", "delivered", "disabled", "headless-dispatched"}
 BUSY_MARKERS = ("esc to interrupt", "ctrl+c to interrupt")
 MAX_MARKER_BUFFER_BYTES = 128 * 1024
 CANCEL_CHECK_INTERVAL_SECONDS = 0.5
 CANCEL_FINALIZE_WAIT_SECONDS = 5.0
 CANCEL_SUPPORTED_SINCE = (0, 3, 0)
+QUEUE_HELP_TIMEOUT_SECONDS = 5.0
+QUEUE_DELIVERY_TIMEOUT_SECONDS = 30.0
 
 
 class JobError(RuntimeError):
@@ -512,6 +514,43 @@ def tmux_binary() -> str:
     return os.environ.get("CODEX_LONG_JOBS_TMUX_BIN", "tmux")
 
 
+def codex_binary() -> str:
+    return os.environ.get("CODEX_LONG_JOBS_CODEX_BIN", "codex")
+
+
+def queue_timeout_seconds() -> float:
+    raw = os.environ.get("CODEX_LONG_JOBS_QUEUE_TIMEOUT_SECONDS")
+    if raw is None:
+        return QUEUE_DELIVERY_TIMEOUT_SECONDS
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return QUEUE_DELIVERY_TIMEOUT_SECONDS
+
+
+def detect_queue_capability() -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            [codex_binary(), "queue", "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=QUEUE_HELP_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        return False, "codex-unavailable"
+    except subprocess.TimeoutExpired:
+        return False, "queue-help-timeout"
+    except OSError as exc:
+        return False, f"queue-help-oserror:{exc.errno}"
+    if result.returncode != 0:
+        return False, f"queue-help-exit-{result.returncode}"
+    help_text = f"{result.stdout}\n{result.stderr}"
+    if "--thread" not in help_text or "--message" not in help_text:
+        return False, "queue-options-unavailable"
+    return True, "supported"
+
+
 def tmux_call(
     socket: str, arguments: list[str], *, check: bool = True
 ) -> subprocess.CompletedProcess[str]:
@@ -699,6 +738,12 @@ def try_tui_submission(
         tmux_call(socket, ["paste-buffer", "-p", "-d", "-b", buffer_name, "-t", pane])
     except subprocess.SubprocessError:
         return False, "paste-failed"
+    set_delivery(
+        name,
+        "delivering",
+        "prompt-pasted",
+        tui_prompt_pasted_at=now_iso(),
+    )
 
     visible = False
     for _ in range(20):
@@ -811,6 +856,103 @@ def deliver_tui(name: str) -> None:
         os.close(fd)
 
 
+def deliver_queue(name: str) -> None:
+    directory = job_dir(name)
+    ensure_private_dir(directory)
+    fd = os.open(delivery_lock_file(name), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        record = read_job(name)
+        if record["status"] not in TERMINAL_STATUSES:
+            return
+        delivery = record.get("delivery", {})
+        if delivery.get("status") in DELIVERY_DONE:
+            return
+        if (
+            delivery.get("status") == "delivering"
+            and delivery.get("reason") == "queue-command-running"
+        ):
+            set_delivery(
+                name,
+                "pending",
+                "queue-dispatch-interrupted-acceptance-unknown",
+                queue_acceptance_uncertain=True,
+                queue_interrupted_at=now_iso(),
+            )
+            return
+        thread = record.get("owner_thread_id")
+        if not thread:
+            set_delivery(name, "pending", "queue-thread-id-unavailable")
+            return
+        attempt = int(delivery.get("queue_attempts", 0)) + 1
+        set_delivery(
+            name,
+            "delivering",
+            "queue-command-running",
+            queue_attempts=attempt,
+            queue_started_at=now_iso(),
+            queue_acceptance_uncertain=True,
+        )
+        try:
+            result = subprocess.run(
+                [
+                    codex_binary(),
+                    "queue",
+                    "--thread",
+                    str(thread),
+                    "--message",
+                    completion_prompt(record),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=queue_timeout_seconds(),
+                cwd=record["cwd"],
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            set_delivery(
+                name,
+                "pending",
+                "queue-command-timeout-acceptance-unknown",
+                queue_acceptance_uncertain=True,
+                queue_failed_at=now_iso(),
+            )
+            return
+        except OSError as exc:
+            set_delivery(
+                name,
+                "pending",
+                f"queue-command-oserror:{exc.errno}",
+                queue_acceptance_uncertain=False,
+                queue_failed_at=now_iso(),
+            )
+            return
+        if result.returncode != 0:
+            set_delivery(
+                name,
+                "pending",
+                f"queue-command-failed:exit-{result.returncode}",
+                queue_acceptance_uncertain=False,
+                queue_exit_code=result.returncode,
+                queue_failed_at=now_iso(),
+            )
+            return
+        set_delivery(
+            name,
+            "queued",
+            "queue-command-accepted",
+            queue_acceptance_uncertain=False,
+            queue_exit_code=0,
+            queued_at=now_iso(),
+        )
+    finally:
+        os.close(fd)
+
+
 def launch_desktop_notification(record: dict[str, Any]) -> None:
     if not record.get("notify_user", True):
         return
@@ -854,12 +996,17 @@ def launch_headless(record: dict[str, Any]) -> None:
     if not thread:
         set_delivery(name, "disabled", "headless-thread-id-unavailable")
         return
-    codex_bin = os.environ.get("CODEX_LONG_JOBS_CODEX_BIN", "codex")
     output = job_dir(name) / "headless-continuation.log"
     try:
         with open_log_for_append(output, create=True) as handle:
             child = subprocess.Popen(
-                [codex_bin, "exec", "resume", thread, completion_prompt(record)],
+                [
+                    codex_binary(),
+                    "exec",
+                    "resume",
+                    thread,
+                    completion_prompt(record),
+                ],
                 cwd=record["cwd"],
                 stdin=subprocess.DEVNULL,
                 stdout=handle,
@@ -879,9 +1026,8 @@ def launch_headless(record: dict[str, Any]) -> None:
     )
 
 
-def finalize_delivery(name: str) -> None:
+def dispatch_delivery(name: str) -> None:
     record = read_job(name)
-    launch_desktop_notification(record)
     mode = record.get("delivery", {}).get("mode")
     if mode == "event-only":
         set_delivery(
@@ -889,8 +1035,15 @@ def finalize_delivery(name: str) -> None:
         )
     elif mode == "headless":
         launch_headless(record)
+    elif mode == "queue":
+        deliver_queue(name)
     else:
         deliver_tui(name)
+
+
+def finalize_delivery(name: str) -> None:
+    launch_desktop_notification(read_job(name))
+    dispatch_delivery(name)
 
 
 def terminate_process_group(
@@ -1330,12 +1483,27 @@ def prepare_log_file(path: Path, *, overwrite: bool, control_directory: Path) ->
 
 
 def select_delivery(
-    requested: str, thread_id: str, endpoint: dict[str, Any] | None, reason: str
+    requested: str,
+    thread_id: str,
+    endpoint: dict[str, Any] | None,
+    reason: str,
+    *,
+    queue_supported: bool = False,
+    queue_reason: str = "not-probed",
 ) -> tuple[str, str]:
     if requested == "auto":
         if thread_id:
+            if queue_supported:
+                return "queue", "auto-queue"
             return "tui", "auto-tui" if endpoint else f"auto-pending-rebind:{reason}"
         return "event-only", "auto-fallback-thread-id-unavailable"
+    if requested == "queue":
+        if not thread_id:
+            return "event-only", "queue-fallback-thread-id-unavailable"
+        if queue_supported:
+            return "queue", "requested-queue"
+        fallback = "tui" if endpoint else f"pending-rebind:{reason}"
+        return "tui", f"queue-fallback-{fallback}:{queue_reason}"
     if requested in {"tui", "headless"} and not thread_id:
         return "event-only", f"{requested}-fallback-thread-id-unavailable"
     return requested, f"requested-{requested}"
@@ -1417,12 +1585,27 @@ def command_start(args: argparse.Namespace) -> int:
     compile_success_pattern(args.success_pattern)
     directory = job_dir(name)
     log_path = choose_log_path(name, args.log)
-    endpoint, endpoint_reason = capture_endpoint()
     thread_id = os.environ.get("CODEX_THREAD_ID", "")
     if not THREAD_RE.fullmatch(thread_id):
         thread_id = ""
+    queue_supported = False
+    queue_reason = "not-probed"
+    if args.delivery in {"auto", "queue"} and thread_id:
+        queue_supported, queue_reason = detect_queue_capability()
+    needs_tui_endpoint = args.delivery == "tui" or (
+        args.delivery in {"auto", "queue"} and thread_id and not queue_supported
+    )
+    if needs_tui_endpoint:
+        endpoint, endpoint_reason = capture_endpoint()
+    else:
+        endpoint, endpoint_reason = None, "not-required-for-selected-delivery"
     mode, selection_reason = select_delivery(
-        args.delivery, thread_id, endpoint, endpoint_reason
+        args.delivery,
+        thread_id,
+        endpoint,
+        endpoint_reason,
+        queue_supported=queue_supported,
+        queue_reason=queue_reason,
     )
     token = f"[codex-long-jobs:{name}:{secrets.token_hex(6)}]"
     record: dict[str, Any] = {
@@ -1447,6 +1630,7 @@ def command_start(args: argparse.Namespace) -> int:
             "reason": selection_reason,
             "token": token,
             "wait_seconds": args.delivery_wait_seconds,
+            "queue_capability_reason": queue_reason,
         },
     }
     directory_was_created = False
@@ -1628,6 +1812,43 @@ def spawn_delivery(name: str) -> int:
     )
 
 
+def delivery_worker_is_active(name: str) -> bool:
+    fd = os.open(delivery_lock_file(name), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def tui_pending_is_safe_to_migrate(record: dict[str, Any]) -> bool:
+    delivery = record.get("delivery", {})
+    if delivery.get("tui_prompt_pasted_at"):
+        return False
+    reason = str(delivery.get("reason", ""))
+    if reason.startswith("auto-pending-rebind:"):
+        return True
+    return reason in {
+        "another-job-is-delivering",
+        "codex-pane-ancestry-mismatch",
+        "codex-process-changed",
+        "composer-not-empty",
+        "endpoint-unavailable",
+        "explicit-rebind",
+        "owning-tui-busy",
+        "pane-capture-failed",
+        "pane-id-mismatch",
+        "pane-identity-mismatch",
+        "pane-process-changed",
+        "tmux-server-restarted",
+        "waiting-for-session-rebind",
+    }
+
+
 def command_rebind(args: argparse.Namespace) -> int:
     if running_under_codex_sandbox():
         raise JobError(
@@ -1691,13 +1912,55 @@ def command_retry_delivery(args: argparse.Namespace) -> int:
     record = read_job(name)
     if record["status"] not in TERMINAL_STATUSES:
         raise JobError("job is not terminal")
-    if record.get("delivery", {}).get("mode") != "tui":
-        raise JobError("job does not use TUI delivery")
-    if record.get("delivery", {}).get("status") == "delivered":
+    delivery = record.get("delivery", {})
+    mode = delivery.get("mode")
+    if mode not in {"queue", "tui"}:
+        raise JobError("job does not use retryable queue or TUI delivery")
+    if delivery.get("status") in DELIVERY_DONE:
         print("delivery already completed")
         return 0
-    if record.get("delivery", {}).get("status") in DELIVERY_DONE:
-        raise JobError("job delivery is already finalized")
+    if args.use_queue and mode == "tui":
+        if not record.get("owner_thread_id"):
+            raise JobError("job has no owner thread ID for queue delivery")
+        if delivery_worker_is_active(name):
+            raise JobError(
+                "the legacy TUI delivery worker is still active; wait for it to exit before migrating"
+            )
+        if (
+            not tui_pending_is_safe_to_migrate(record)
+            and not args.allow_possible_duplicate
+        ):
+            raise JobError(
+                "TUI delivery may already have pasted or submitted a prompt; refusing queue migration without --allow-possible-duplicate"
+            )
+        supported, reason = detect_queue_capability()
+        if not supported:
+            raise JobError(f"codex queue is unavailable: {reason}")
+
+        def migrate(current: dict[str, Any]) -> dict[str, Any]:
+            current_delivery = current["delivery"]
+            current_delivery["mode"] = "queue"
+            current_delivery["status"] = "pending"
+            current_delivery["reason"] = "explicit-queue-migration"
+            current_delivery["selection_reason"] = "explicit-queue-migration"
+            current_delivery["migrated_from_mode"] = "tui"
+            current_delivery["migrated_at"] = now_iso()
+            current_delivery["queue_capability_reason"] = reason
+            return current
+
+        record = update_job(name, migrate)
+        delivery = record["delivery"]
+        mode = "queue"
+    elif args.use_queue and mode != "queue":
+        raise JobError("job cannot be migrated to queue delivery")
+    if (
+        mode == "queue"
+        and delivery.get("queue_acceptance_uncertain")
+        and not args.allow_possible_duplicate
+    ):
+        raise JobError(
+            "queue acceptance is uncertain; inspect the owner thread before retrying or use --allow-possible-duplicate"
+        )
     pid = spawn_delivery(name)
     print(f"delivery_worker_pid={pid}")
     return 0
@@ -1731,6 +1994,9 @@ def command_doctor(_: argparse.Namespace) -> int:
     print(f"state_root={state_root()}")
     print(f"tmux={shutil.which(tmux_binary()) or 'unavailable'}")
     print(f"tail={shutil.which('tail') or 'unavailable'}")
+    queue_supported, queue_reason = detect_queue_capability()
+    print(f"queue_delivery={'available' if queue_supported else 'unavailable'}")
+    print(f"queue_reason={queue_reason}")
     endpoint, reason = capture_endpoint()
     print(f"tui_endpoint={reason}")
     if endpoint:
@@ -1750,7 +2016,9 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--success-pattern")
     start.add_argument("--overwrite-log", action="store_true")
     start.add_argument(
-        "--delivery", choices=["auto", "tui", "headless", "event-only"], default="auto"
+        "--delivery",
+        choices=["auto", "queue", "tui", "headless", "event-only"],
+        default="auto",
     )
     start.add_argument("--viewer", choices=["auto", "tmux", "none"], default="auto")
     start.add_argument("--delivery-wait-seconds", type=positive_int, default=86400)
@@ -1779,9 +2047,19 @@ def parser() -> argparse.ArgumentParser:
     rebind.set_defaults(func=command_rebind)
 
     retry = sub.add_parser(
-        "retry-delivery", help="retry a terminal job's pending TUI delivery"
+        "retry-delivery", help="retry a terminal job's pending completion delivery"
     )
     retry.add_argument("--name", required=True)
+    retry.add_argument(
+        "--use-queue",
+        action="store_true",
+        help="migrate a safely pending TUI notification to codex queue",
+    )
+    retry.add_argument(
+        "--allow-possible-duplicate",
+        action="store_true",
+        help="retry even when prior queue acceptance or TUI submission is uncertain",
+    )
     retry.set_defaults(func=command_retry_delivery)
 
     view = sub.add_parser(
@@ -1810,7 +2088,7 @@ def parser() -> argparse.ArgumentParser:
 
     deliver = sub.add_parser("_deliver")
     deliver.add_argument("--name", required=True)
-    deliver.set_defaults(func=lambda args: (deliver_tui(args.name), 0)[1])
+    deliver.set_defaults(func=lambda args: (dispatch_delivery(args.name), 0)[1])
     return root
 
 

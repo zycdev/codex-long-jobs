@@ -5,6 +5,22 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Prefer `codex queue --thread` for automatic completion delivery when the
+  installed CLI supports it, without depending on tmux pane metadata.
+- Record queue acceptance separately from session consumption, suppress normal
+  duplicate dispatch, and preserve ambiguous timeout or restart outcomes for
+  explicit review.
+- Add guarded migration of terminal pending TUI notifications to queue delivery.
+
+### Changed
+
+- Retain conservative TUI delivery as the automatic compatibility path for
+  older Codex CLI versions.
+- Report queue capability in `doctor` and document real Codex CLI 0.157.1 idle,
+  busy, exited-TUI, and one-shot-client acceptance boundaries.
+
 ## [0.3.1] - 2026-09-21
 
 ### Added

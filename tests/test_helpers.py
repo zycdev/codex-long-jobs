@@ -233,6 +233,17 @@ class HelperTests(unittest.TestCase):
     def test_delivery_selection_matrix(self) -> None:
         endpoint = {"pane_id": "%1"}
         self.assertEqual(
+            RUNTIME.select_delivery(
+                "auto",
+                "thread-id",
+                endpoint,
+                "ok",
+                queue_supported=True,
+                queue_reason="supported",
+            ),
+            ("queue", "auto-queue"),
+        )
+        self.assertEqual(
             RUNTIME.select_delivery("auto", "thread-id", endpoint, "ok"),
             ("tui", "auto-tui"),
         )
@@ -252,6 +263,49 @@ class HelperTests(unittest.TestCase):
             RUNTIME.select_delivery("event-only", "thread-id", None, "ignored"),
             ("event-only", "requested-event-only"),
         )
+        self.assertEqual(
+            RUNTIME.select_delivery(
+                "queue",
+                "thread-id",
+                None,
+                "no-pane",
+                queue_supported=False,
+                queue_reason="queue-options-unavailable",
+            ),
+            (
+                "tui",
+                "queue-fallback-pending-rebind:no-pane:queue-options-unavailable",
+            ),
+        )
+
+    def test_queue_capability_requires_both_queue_options(self) -> None:
+        supported = subprocess.CompletedProcess(
+            [], 0, stdout="--thread <THREAD> --message <TEXT>", stderr=""
+        )
+        with mock.patch.object(RUNTIME.subprocess, "run", return_value=supported):
+            self.assertEqual(RUNTIME.detect_queue_capability(), (True, "supported"))
+        incomplete = subprocess.CompletedProcess(
+            [], 0, stdout="--thread <THREAD>", stderr=""
+        )
+        with mock.patch.object(RUNTIME.subprocess, "run", return_value=incomplete):
+            self.assertEqual(
+                RUNTIME.detect_queue_capability(),
+                (False, "queue-options-unavailable"),
+            )
+        with mock.patch.object(
+            RUNTIME.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["codex", "queue"], 5),
+        ):
+            self.assertEqual(
+                RUNTIME.detect_queue_capability(), (False, "queue-help-timeout")
+            )
+
+    def test_delivery_worker_lock_detection_is_conservative(self) -> None:
+        self.write_record("delivery-lock")
+        self.assertFalse(RUNTIME.delivery_worker_is_active("delivery-lock"))
+        with mock.patch.object(RUNTIME.fcntl, "flock", side_effect=BlockingIOError):
+            self.assertTrue(RUNTIME.delivery_worker_is_active("delivery-lock"))
 
     def test_screen_classification(self) -> None:
         self.assertTrue(RUNTIME.screen_is_busy("Working, ESC TO INTERRUPT"))

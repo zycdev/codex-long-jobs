@@ -5,6 +5,7 @@
 - Runtime architecture
 - Terminal-state rules
 - Cancellation state machine
+- Queue delivery state machine
 - TUI delivery state machine
 - Session exit and resume
 - tmux failure behavior
@@ -107,6 +108,35 @@ that deliberately calls `setsid`, submits work to a scheduler, or launches a
 container can escape that boundary and requires its native cancellation
 mechanism.
 
+## Queue delivery state machine
+
+For `auto` delivery, the launcher checks the installed CLI locally with
+`codex queue --help`. When `--thread` and `--message` are supported and an owner
+thread ID is available, the job records `mode: queue` and does not capture a
+tmux endpoint. Older CLIs retain the TUI transport.
+
+At terminal state, the delivery worker serializes per-job dispatch, records a
+`queue-command-running` attempt, and invokes `codex queue --thread OWNER
+--message PROMPT`. Exit code zero changes the delivery status to `queued` with
+reason `queue-command-accepted`. This proves only that the CLI accepted the
+message. Session-side execution and consumption are outside the transport
+acknowledgement.
+
+A nonzero command result remains pending and may be retried explicitly. A
+timeout or a delivery process that restarts after recording
+`queue-command-running` has uncertain acceptance. The worker records that
+uncertainty and does not retransmit automatically, because the first invocation
+may already have enqueued the message. Normal repeated delivery workers also
+observe `queued` as final and do not send a second message.
+
+`retry-delivery --use-queue` can migrate a terminal legacy TUI notification
+only when its durable state proves that no prompt was pasted, such as
+`waiting-for-session-rebind`, a pane identity failure, a busy TUI, or a nonempty
+composer. Records with a paste timestamp or an ambiguous historical reason are
+refused unless the caller explicitly supplies `--allow-possible-duplicate`.
+Migration is also refused while a legacy delivery worker holds the per-job
+lock. Never migrate a running old worker because it retains its loaded runtime.
+
 ## TUI delivery state machine
 
 TUI delivery validates all of the following before input injection:
@@ -140,11 +170,17 @@ The job keeps running when Codex exits because the supervisor, worker, and
 command are not owned by the tmux viewer. However, the original delivery
 binding becomes invalid when the Codex PID changes.
 
-Resume the original thread, then invoke `rebind --name NAME` or `rebind --all`
-from its new tmux-hosted TUI. Rebind requires the current `CODEX_THREAD_ID` to
-equal the job owner. It works in the original pane or a different pane. Without
-this explicit step, automatic delivery cannot safely infer that a restarted
-TUI is displaying the same thread.
+Queue delivery continues to address the recorded owner thread after the TUI
+exits and does not use pane identity. Real acceptance with Codex CLI 0.157.1
+confirmed consumption through the persistent app-server daemon after the
+isolated TUI exited.
+
+For TUI-mode records, resume the original thread, then invoke
+`rebind --name NAME` or `rebind --all` from its new tmux-hosted TUI. Rebind
+requires the current `CODEX_THREAD_ID` to equal the job owner. It works in the
+original pane or a different pane. Without this explicit step, automatic TUI
+delivery cannot safely infer that a restarted TUI is displaying the same
+thread.
 
 An in-process `/new` or `/resume` switch is also not observable through a
 supported Codex CLI API. Rebind after such a switch before relying on pending
@@ -195,8 +231,11 @@ for workloads requiring host-crash recovery.
 - Linux validates surviving process-group members against both group and
   session identity. The non-Linux fallback can validate only the original group
   leader, so cancellation after that leader exits is not guaranteed there.
-- Direct TUI delivery uses conservative tmux input injection because Codex CLI
-  does not yet expose a stable public idle-wake API for arbitrary local tools.
+- Queue delivery requires a Codex CLI that exposes `codex queue --thread` and a
+  reachable local app-server daemon. The command acknowledgement does not prove
+  session consumption.
+- Direct TUI delivery remains a conservative compatibility transport for older
+  Codex CLIs and explicitly selected TUI mode.
 - The supervisor and worker survive tmux failure, not machine reboot. Jobs are
   host-local.
 - A running worker survives supervisor-only loss, but there is no automatic

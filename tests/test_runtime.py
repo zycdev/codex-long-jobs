@@ -15,6 +15,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 CLI = REPO / "scripts" / "codex_long_jobs.py"
 FAKE_TMUX = REPO / "tests" / "fake_tmux.py"
+FAKE_CODEX = REPO / "tests" / "fake_codex.py"
 
 
 class RuntimeTests(unittest.TestCase):
@@ -24,6 +25,8 @@ class RuntimeTests(unittest.TestCase):
         self.state = self.root / "state"
         self.viewer_label = f"clj-test-{os.getpid()}-{time.time_ns()}"
         self.env = os.environ.copy()
+        self.env.pop("CODEX_SESSION_ID", None)
+        self.env.pop("CODEX_THREAD_ID", None)
         self.env.update(
             CODEX_LONG_JOBS_STATE_DIR=str(self.state),
             CODEX_LONG_JOBS_ALLOW_SANDBOX="1",
@@ -101,6 +104,19 @@ class RuntimeTests(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"delivery did not reach {sorted(expected)}: {name}")
 
+    def wait_delivery_reason(
+        self, name: str, expected: set[str], timeout: float = 8
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        path = self.state / "jobs" / name / "state.json"
+        while time.monotonic() < deadline:
+            if path.exists():
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if record.get("delivery", {}).get("reason") in expected:
+                    return record
+            time.sleep(0.05)
+        self.fail(f"delivery reason did not reach {sorted(expected)}: {name}")
+
     def start(
         self, name: str, code: str, *extra: str, env: dict[str, str] | None = None
     ) -> dict:
@@ -122,6 +138,44 @@ class RuntimeTests(unittest.TestCase):
             sys.executable,
             "-c",
             code,
+            env=env,
+        )
+        return self.wait_terminal(name)
+
+    def queue_env(self, thread: str) -> tuple[dict[str, str], Path]:
+        fake_root = self.root / "fake-codex"
+        env = self.env.copy()
+        env.update(
+            CODEX_THREAD_ID=thread,
+            CODEX_LONG_JOBS_CODEX_BIN=str(FAKE_CODEX),
+            FAKE_CODEX_STATE_DIR=str(fake_root),
+            TMUX="",
+            TMUX_PANE="%missing",
+        )
+        return env, fake_root
+
+    def start_queue_job(
+        self, name: str, env: dict[str, str], *, wait_seconds: int = 3
+    ) -> dict:
+        log = self.root / f"{name}.log"
+        self.cli(
+            "start",
+            "--name",
+            name,
+            "--log",
+            str(log),
+            "--success-pattern",
+            "^DONE$",
+            "--delivery",
+            "auto",
+            "--delivery-wait-seconds",
+            str(wait_seconds),
+            "--viewer",
+            "none",
+            "--",
+            sys.executable,
+            "-c",
+            "print('DONE')",
             env=env,
         )
         return self.wait_terminal(name)
@@ -914,6 +968,161 @@ class RuntimeTests(unittest.TestCase):
         state_path.chmod(0o600)
         return state_path
 
+    def test_auto_queue_delivery_needs_no_tui_and_suppresses_duplicates(self) -> None:
+        thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
+        env, fake_root = self.queue_env(thread)
+        self.start_queue_job("queue-success", env)
+        record = self.wait_delivery("queue-success", {"queued"})
+
+        self.assertEqual(record["delivery"]["mode"], "queue")
+        self.assertEqual(record["delivery"]["reason"], "queue-command-accepted")
+        self.assertEqual(record["delivery"]["queue_attempts"], 1)
+        self.assertIsNone(record["endpoint"])
+        self.assertEqual(
+            record["endpoint_capture_reason"], "not-required-for-selected-delivery"
+        )
+        attempts_path = fake_root / "queue-attempts.jsonl"
+        attempts = attempts_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(attempts), 1)
+        arguments = json.loads(attempts[0])
+        self.assertEqual(arguments[:4], ["queue", "--thread", thread, "--message"])
+        self.assertIn("completed successfully", arguments[4])
+        self.assertIn(record["delivery"]["token"], arguments[4])
+
+        self.cli("_deliver", "--name", "queue-success", env=env)
+        retried = self.cli("retry-delivery", "--name", "queue-success", env=env)
+        self.assertIn("delivery already completed", retried.stdout)
+        self.assertEqual(len(attempts_path.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_auto_falls_back_to_tui_when_queue_is_unavailable(self) -> None:
+        thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
+        env, fake_root = self.queue_env(thread)
+        env["FAKE_CODEX_QUEUE_HELP_MODE"] = "missing"
+        self.start_queue_job("queue-fallback", env, wait_seconds=1)
+        record = self.wait_delivery_reason(
+            "queue-fallback",
+            {"delivery-wait-expired-rebind-or-retry-required"},
+        )
+
+        self.assertEqual(record["delivery"]["mode"], "tui")
+        self.assertEqual(
+            record["delivery"]["selection_reason"],
+            "auto-pending-rebind:not-running-in-tmux",
+        )
+        self.assertFalse((fake_root / "queue-attempts.jsonl").exists())
+
+    def test_queue_failure_can_be_retried_after_daemon_recovery(self) -> None:
+        thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
+        env, fake_root = self.queue_env(thread)
+        env["FAKE_CODEX_QUEUE_MODE"] = "failure"
+        self.start_queue_job("queue-retry", env)
+        failed = self.wait_delivery_reason(
+            "queue-retry", {"queue-command-failed:exit-9"}
+        )
+        self.assertFalse(failed["delivery"]["queue_acceptance_uncertain"])
+
+        recovered_env = env.copy()
+        recovered_env["FAKE_CODEX_QUEUE_MODE"] = "success"
+        result = self.cli("retry-delivery", "--name", "queue-retry", env=recovered_env)
+        self.assertIn("delivery_worker_pid=", result.stdout)
+        delivered = self.wait_delivery("queue-retry", {"queued"})
+        self.assertEqual(delivered["delivery"]["queue_attempts"], 2)
+        self.assertEqual(
+            len(
+                (fake_root / "queue-attempts.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ),
+            2,
+        )
+
+    def test_queue_timeout_blocks_automatic_duplicate_retry(self) -> None:
+        thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
+        env, fake_root = self.queue_env(thread)
+        env.update(
+            FAKE_CODEX_QUEUE_MODE="timeout",
+            CODEX_LONG_JOBS_QUEUE_TIMEOUT_SECONDS="0.1",
+        )
+        self.start_queue_job("queue-timeout", env)
+        record = self.wait_delivery_reason(
+            "queue-timeout", {"queue-command-timeout-acceptance-unknown"}
+        )
+        self.assertTrue(record["delivery"]["queue_acceptance_uncertain"])
+
+        retry = self.cli(
+            "retry-delivery", "--name", "queue-timeout", env=env, check=False
+        )
+        self.assertNotEqual(retry.returncode, 0)
+        self.assertIn("queue acceptance is uncertain", retry.stderr)
+        self.assertEqual(
+            len(
+                (fake_root / "queue-attempts.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ),
+            1,
+        )
+
+    def test_interrupted_queue_dispatch_recovers_without_resending(self) -> None:
+        thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
+        env, fake_root = self.queue_env(thread)
+        state_path = self.write_terminal_job("queue-interrupted", {}, thread)
+        record = json.loads(state_path.read_text(encoding="utf-8"))
+        record["delivery"].update(
+            mode="queue",
+            status="delivering",
+            reason="queue-command-running",
+            queue_acceptance_uncertain=True,
+            queue_attempts=1,
+        )
+        state_path.write_text(json.dumps(record), encoding="utf-8")
+
+        self.cli("_deliver", "--name", "queue-interrupted", env=env)
+        recovered = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            recovered["delivery"]["reason"],
+            "queue-dispatch-interrupted-acceptance-unknown",
+        )
+        self.assertFalse((fake_root / "queue-attempts.jsonl").exists())
+
+    def test_safe_pending_tui_delivery_can_migrate_to_queue(self) -> None:
+        thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
+        env, fake_root = self.queue_env(thread)
+        state_path = self.write_terminal_job("queue-migration", {}, thread)
+        record = json.loads(state_path.read_text(encoding="utf-8"))
+        record["endpoint"] = None
+        record["delivery"]["reason"] = "waiting-for-session-rebind"
+        state_path.write_text(json.dumps(record), encoding="utf-8")
+
+        result = self.cli(
+            "retry-delivery",
+            "--name",
+            "queue-migration",
+            "--use-queue",
+            env=env,
+        )
+        self.assertIn("delivery_worker_pid=", result.stdout)
+        migrated = self.wait_delivery("queue-migration", {"queued"})
+        self.assertEqual(migrated["delivery"]["mode"], "queue")
+        self.assertEqual(migrated["delivery"]["migrated_from_mode"], "tui")
+        self.assertTrue((fake_root / "queue-attempts.jsonl").exists())
+
+        unsafe_path = self.write_terminal_job("queue-migration-unsafe", {}, thread)
+        unsafe = json.loads(unsafe_path.read_text(encoding="utf-8"))
+        unsafe["delivery"]["reason"] = "prompt-not-visible-after-paste"
+        unsafe["delivery"]["tui_prompt_pasted_at"] = "test"
+        unsafe_path.write_text(json.dumps(unsafe), encoding="utf-8")
+        refused = self.cli(
+            "retry-delivery",
+            "--name",
+            "queue-migration-unsafe",
+            "--use-queue",
+            env=env,
+            check=False,
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("may already have pasted", refused.stderr)
+
     def test_busy_tui_waits_then_retries_missed_enter_without_duplicate_paste(
         self,
     ) -> None:
@@ -1039,7 +1248,7 @@ class RuntimeTests(unittest.TestCase):
         self.start("no-tui", "print('DONE')")
         result = self.cli("retry-delivery", "--name", "no-tui", check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not use TUI delivery", result.stderr)
+        self.assertIn("does not use retryable queue or TUI delivery", result.stderr)
 
     def test_retry_delivery_submits_pending_tui_job(self) -> None:
         thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"

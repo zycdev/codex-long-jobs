@@ -9,19 +9,20 @@ the original Codex session when the process finishes.**
 Codex CLI. It runs long-running background jobs and other background processes
 as detached OS processes. The current turn can end while a local worker waits
 for process completion with no LLM polling. When the command exits, the worker
-can wake the original Codex session by safely delivering a completion prompt to
-its tmux-hosted Codex TUI.
+can wake the original Codex session through `codex queue`, with conservative
+tmux-hosted TUI delivery retained for older Codex CLI versions.
 
 - Detached and async job execution on Linux servers and over SSH, independent
   of the optional tmux viewer.
 - No LLM/model polling while a command is running.
 - Event-driven completion notification on success, failure, or abnormal exit.
-- Safe tmux-based wake-up of the owning Codex TUI, with same-thread resume and
-  rebind.
+- Thread-addressed wake-up through `codex queue`, independent of tmux pane
+  identity when the installed CLI supports it.
+- Safe tmux-based compatibility delivery, with same-thread resume and rebind.
 - Durable job state, logs, exit code, signal, and delivery status.
 - An optional tmux log viewer that never owns the supervised process.
 
-> Status: `v0.3.1` beta. Linux is the primary tested platform. Python 3.10 or
+> Status: `v0.4.0` beta. Linux is the primary tested platform. Python 3.10 or
 > newer is required.
 
 ## Why codex-long-jobs? Run long-running processes without model polling
@@ -46,7 +47,7 @@ start detached job
 -> worker waits locally
 -> process exits
 -> completion event
--> original Codex TUI is safely awakened
+-> original Codex session is queued or safely awakened
 ```
 
 The model does not need to periodically poll the process. A multi-hour build,
@@ -55,16 +56,17 @@ command can continue without consuming model turns just to check whether it has
 finished. This provides asynchronous process completion handling without
 keeping the agent turn open.
 
-## How wake-up works for the original Codex TUI
+## How wake-up works for the original Codex session
 
-At launch, the controller records the owner `CODEX_THREAD_ID` and a validated
-endpoint for the owning tmux pane and Codex process. It then starts a detached
-supervisor, worker, and child command outside the tmux viewer.
+At launch, the controller records the owner `CODEX_THREAD_ID`. When the
+installed CLI supports `codex queue --thread`, automatic delivery needs no tmux
+endpoint. Older CLIs retain the validated tmux pane and Codex process path. The
+supervisor, worker, and child command always run outside the viewer.
 
 ```text
-Original Codex thread and owning tmux pane
+Original Codex thread
                     |
-                    | start and capture identity
+                    | start and record owner UUID
                     v
        detached supervisor -> detached worker -> child process
                     |                 |                |
@@ -76,27 +78,33 @@ Original Codex thread and owning tmux pane
                                       durable state, log, exit code or signal
                                                        |
                                                        v
-                                    validate same thread, pane, and Codex PID
-                                                       |
-                                   wait for TUI idle and composer empty
+                                    codex queue --thread OWNER --message PROMPT
                                                        |
                                                        v
-                                   tmux paste-buffer plus safe Enter retry
-                                                       |
-                                                       v
-                                      new normal turn in the owning Codex TUI
+                                      queued normal turn in the owner thread
+
+Older CLI compatibility branch:
+validate same thread, pane, and Codex PID
+-> wait for TUI idle and composer empty
+-> tmux paste-buffer plus safe Enter retry
 ```
 
-The safe delivery boundary prevents a completion message from being pasted into
-a busy turn or a nonempty composer. A unique token, process identities, pane
-identity, and a cross-job delivery lock reduce stale-session and duplicate
+Queue delivery records status `queued` only after the CLI returns success. This
+means the command accepted the message. It does not prove that the owner session
+consumed or completed the new turn. Per-job locking suppresses normal duplicate
+dispatch. A timeout or interrupted invocation remains pending with uncertain
+acceptance instead of being resent automatically.
+
+A terminal legacy TUI notification can be migrated with
+`retry-delivery --use-queue` only after its old delivery worker exits and its
+durable reason proves that no prompt was pasted. Ambiguous records require
+explicit duplicate-risk acknowledgement.
+
+The compatibility TUI boundary prevents a completion message from being pasted
+into a busy turn or a nonempty composer. A unique token, process identities,
+pane identity, and a cross-job delivery lock reduce stale-session and duplicate
 submission risks. The completion prompt contains state and log paths, not
 untrusted process output.
-
-Codex CLI currently lacks a stable public API for arbitrary local processes to
-wake an existing interactive TUI session, so `codex-long-jobs` uses safe tmux
-input injection for live TUI delivery. The prompt is loaded through a named
-tmux paste buffer, verified as visible, and submitted only at the safe boundary.
 
 This is event-driven from the model's perspective: the model is not invoked
 until the background process has actually completed and a completion message is
@@ -118,11 +126,13 @@ polling.
 - **Storage failure handling.** Partial writes and fsync failures are detected.
   A small reserved state file improves the chance of recording failure when the
   state filesystem is nearly full.
-- **Safe concurrent delivery.** Completion waits for an idle TUI and empty
-  composer. A global lock serializes jobs that finish at the same time, and a
-  missed first `Enter` is retried without pasting another prompt.
-- **Session recovery.** A pending job can be rebound after the original Codex
-  thread is resumed in the same or a different tmux pane.
+- **Safe concurrent delivery.** Queue delivery is serialized per job and treats
+  accepted delivery as final. Compatibility TUI delivery waits for an idle TUI
+  and empty composer, serializes jobs globally, and retries a missed first
+  `Enter` without pasting another prompt.
+- **Session recovery.** Queue delivery continues by owner thread UUID. A pending
+  compatibility TUI job can be rebound after the original thread is resumed in
+  the same or a different tmux pane.
 - **Persistent inspection.** State, logs, exit information, and delivery status
   remain available through `status`, `tail`, and an optional disposable tmux
   viewer.
@@ -139,14 +149,15 @@ Codex without polling. Typical uses include:
 - simulations, migrations, package installation, and environment setup;
 - large code generation, compilation, packaging, and deployment pipelines.
 
-The primary environment is a Linux server reached over SSH, with Codex CLI
-running in tmux when automatic live TUI wake-up is wanted.
+The primary environment is a Linux server reached over SSH. Current Codex CLI
+versions can wake the owner thread through the local app-server daemon. tmux is
+needed only for the compatibility TUI transport and optional log viewer.
 
 ## Install the Codex skill
 
-Python 3.10 or newer is required. tmux is required for live wake-up of the
-original Codex CLI TUI and for the optional log viewer. Install tmux with one
-of these methods:
+Python 3.10 or newer is required. tmux is optional when `codex queue` is
+available. It remains required for compatibility TUI delivery and the optional
+log viewer. Install tmux with one of these methods:
 
 ```bash
 # Ubuntu or Debian
@@ -171,8 +182,8 @@ tmux new-session -s codex
 
 Then run `codex` from the shell inside the new tmux session.
 
-Without tmux, detached execution, durable state, and non-TUI delivery modes
-remain available, but the skill cannot wake an already-open Codex TUI.
+Without tmux, detached execution, durable state, and queue delivery remain
+available on supported Codex CLI versions.
 
 From an existing Codex session, a new user can ask Codex to perform the
 installation:
@@ -264,8 +275,13 @@ scripts/codex-long-jobs view --name train-model-run-01
 # Rebind jobs after resuming the same original Codex thread
 scripts/codex-long-jobs rebind --all
 
-# Retry a terminal job whose TUI delivery remains pending
+# Retry a terminal job whose queue or TUI delivery remains pending
 scripts/codex-long-jobs retry-delivery --name train-model-run-01
+
+# Safely migrate a legacy pending TUI notification to queue delivery
+scripts/codex-long-jobs retry-delivery \
+  --name train-model-run-01 \
+  --use-queue
 
 # Inspect runtime and TUI binding prerequisites
 scripts/codex-long-jobs doctor
@@ -313,13 +329,13 @@ Codex conversation when the process completes.
 | Keep a command outside the current Codex turn | Yes, with correct shell handling | Yes | Yes, with a detached worker and supervisor |
 | Durable lifecycle metadata, exit status, and failure reasons | Manual | Manual | Built in |
 | Persistent combined log and optional success marker | Manual | Manual | Built in |
-| Track the owning Codex thread and TUI endpoint | No | No | Yes |
-| Wake or resume the original Codex session on completion | No | No | Yes, for a validated tmux-hosted Codex TUI |
+| Track the owning Codex thread and optional TUI endpoint | No | No | Yes |
+| Wake or resume the original Codex session on completion | No | No | Yes, through `codex queue` or a validated compatibility TUI |
 | Protect against stale panes and support explicit rebind | No | No | Yes |
 | Keep the command alive if the optional viewer tmux server fails | Not applicable | Usually no | Yes |
 
-tmux remains important for direct Codex TUI wake-up, but it is a transport and
-optional log viewer, not the process supervisor.
+tmux remains available as a compatibility transport and optional log viewer. It
+is not the process supervisor.
 
 ## How codex-long-jobs differs from model polling
 
@@ -346,9 +362,9 @@ turns.
 
 The detached worker itself uses no model tokens. Starting the job and handling
 its completion are normal Codex turns, but progress-only model turns are not
-needed. Delivery may use lightweight local readiness polling to wait for an
-idle TUI and empty composer. This is not LLM/model polling and does not consume
-model turns.
+needed. Compatibility TUI delivery may use lightweight local readiness polling
+to wait for an idle TUI and empty composer. This is not LLM/model polling and
+does not consume model turns.
 
 No universal percentage token saving is claimed. If the alternative is one
 foreground tool call that blocks until exit without intermediate model turns,
@@ -357,10 +373,11 @@ the same final result inspection and authorized follow-up work.
 
 ## Resume and rebind Codex sessions after process completion
 
-The worker and command continue if the original Codex process exits. The old
-TUI binding then becomes invalid because its Codex process identity changed.
-After resuming the same original thread in any tmux pane, send Codex this
-prompt:
+The worker and command continue if the original Codex process exits. Queue-mode
+jobs continue to address the recorded thread UUID and require no pane rebind.
+For a pending compatibility TUI job, the old binding becomes invalid because
+its Codex process identity changed. After resuming the same original thread in
+any tmux pane, send Codex this prompt:
 
 ```text
 I resumed the original Codex thread in this tmux pane. Use $codex-long-jobs to
@@ -380,8 +397,10 @@ a different Codex thread cannot claim the job.
 
 ## Completion delivery modes
 
-- `auto` selects direct TUI delivery when an owner thread is available;
-  otherwise it records durable event-only state.
+- `auto` selects queue delivery when the owner thread and `codex queue` are
+  available, falls back to TUI delivery on older CLIs, and otherwise records
+  durable event-only state.
+- `queue` explicitly requests thread-addressed queue delivery.
 - `tui` targets the validated tmux-hosted Codex CLI TUI.
 - `event-only` records completion without starting another Codex turn.
 - `headless` starts a separate `codex exec resume` only when explicitly
@@ -398,43 +417,47 @@ progress.
 
 ### Does codex-long-jobs use LLM polling?
 
-No LLM/model polling occurs while the job is running. After completion, the
-delivery worker may check local tmux and TUI readiness until the owning TUI is
-idle and its composer is empty. These checks are ordinary local process work
-and do not invoke a model.
+No LLM/model polling occurs while the job is running. Queue delivery invokes one
+completion turn after the process exits. The compatibility delivery worker may
+check local tmux and TUI readiness until the owning TUI is idle and its composer
+is empty. These checks are ordinary local process work and do not invoke a
+model.
 
 ### How can Codex automatically continue when a background process finishes?
 
-For a validated tmux-hosted Codex CLI session, the worker submits a completion
-prompt after the process reaches terminal state. That prompt starts a normal
-Codex turn in the owning conversation. The completion message authorizes only
-inspection and follow-up work already authorized by that conversation.
+The worker queues a completion prompt to the recorded owner thread after the
+process reaches terminal state. On older CLIs, it uses the validated tmux-hosted
+TUI instead. The prompt starts a normal Codex turn and authorizes only inspection
+and follow-up work already authorized by that conversation.
 
 ### Can a background process wake the original Codex CLI session?
 
-Yes, when the original Codex TUI is running in the recorded tmux endpoint and
-still shows the owning thread. If Codex restarted, resume the same thread and
-run `rebind`; a different thread is rejected.
+Yes. Current CLIs accept a queued message addressed by owner thread UUID, and
+host acceptance confirms delivery after the TUI exits while the app-server
+daemon remains available. Older TUI-mode jobs require the original thread to be
+resumed and rebound; a different thread is rejected.
 
-### Why does codex-long-jobs use tmux?
+### Why does codex-long-jobs still support tmux delivery?
 
-Codex CLI has no stable public API for an arbitrary local process to wake an
-existing interactive TUI. tmux provides a verifiable pane identity and a
-controlled terminal input injection path. Job execution itself is independent
-of the optional tmux viewer.
+Older Codex CLI versions do not provide `codex queue`. tmux supplies a
+verifiable pane identity and controlled terminal input path for that
+compatibility case. Job execution and current queue delivery are independent of
+the optional tmux viewer.
 
 ### Does the job survive closing Codex?
 
 Under normal host process policy, yes. The detached supervisor, worker, and
-command continue after the Codex process exits. Live delivery waits until the
-same original thread is resumed in tmux and explicitly rebound. This is not a
-machine reboot guarantee.
+command continue after the Codex process exits. Queue delivery can address the
+same owner thread through the persistent daemon. Compatibility TUI delivery
+waits until the thread is resumed in tmux and rebound. This is not a machine
+reboot guarantee.
 
 ### What happens if the original Codex session is restarted?
 
-Resume the same thread, which preserves its `CODEX_THREAD_ID`, then run
-`rebind --name NAME` or `rebind --all` from the new tmux-hosted TUI. Rebind can
-target the original pane or a different pane.
+Queue-mode completion still targets the recorded thread UUID. For TUI-mode
+delivery, resume the same thread, which preserves its `CODEX_THREAD_ID`, then
+run `rebind --name NAME` or `rebind --all` from the new tmux-hosted TUI. Rebind
+can target the original pane or a different pane.
 
 ### Is this the same as nohup or command &?
 
@@ -453,10 +476,11 @@ the tmux viewer exits.
 
 ### How do I run background jobs from Codex CLI on a Linux server over SSH?
 
-Run Codex CLI inside tmux, install the skill, and start the job with scoped host
-permission. The detached process is designed to continue across an ordinary
-SSH disconnect, subject to the server's process and login-session policy. Keep
-or restore a tmux-hosted Codex TUI for live wake-up.
+Install the skill and start the job with scoped host permission. The detached
+process is designed to continue across an ordinary SSH disconnect, subject to
+the server's process and login-session policy. Current CLIs can deliver through
+the app-server daemon. Keep or restore a tmux-hosted Codex TUI only when using
+the compatibility transport.
 
 ### How can Codex wait for a multi-hour job without using model turns to check progress?
 
@@ -466,9 +490,10 @@ successful prompt delivery start the next normal Codex turn.
 
 ### Does it work with the Codex VS Code extension?
 
-No live wake support is claimed for the Codex VS Code extension. The current
-automatic TUI wake path specifically targets OpenAI Codex CLI running inside
-tmux. Event-only job execution is separate from extension UI synchronization.
+No live UI synchronization claim is made for the Codex VS Code extension.
+Queue delivery targets the Codex thread through the local app-server daemon;
+whether a particular extension UI repaints that thread is outside the tested
+contract. Event-only execution remains independent of extension UI behavior.
 
 ## Safety and limitations for detached Codex jobs
 
@@ -477,10 +502,12 @@ tmux. Event-only job execution is separate from extension UI synchronization.
 - State stores argv and working directory. Do not put secrets in argv.
 - Cancellation targets the validated process group created for the command,
   not processes that deliberately escape that OS session.
-- Direct TUI wake-up depends on current Codex TUI rendering and tmux input
-  behavior, so meaningful Codex CLI changes require acceptance retesting.
-- Rebind is mandatory after the Codex process exits or the displayed thread
-  changes. Simply returning to the old pane is insufficient.
+- Queue command success proves acceptance, not consumption. Timeout and process
+  interruption therefore remain pending when acceptance is uncertain.
+- Compatibility TUI wake-up depends on Codex rendering and tmux input behavior,
+  so meaningful CLI changes require acceptance retesting.
+- Rebind is mandatory for TUI-mode delivery after the Codex process exits or
+  the displayed thread changes. Queue-mode delivery does not use pane identity.
 - The worker can finish and deliver after the supervisor alone is killed once
   the job is running. No replacement supervisor is created, so a later worker
   failure would no longer be detected.
@@ -509,10 +536,12 @@ python3 /path/to/skill-creator/scripts/quick_validate.py .
 ```
 
 The automated suite covers lifecycle, kernel and simulated write failures,
-signals, worker death, concurrent starts and deliveries, tmux viewer failure,
-busy-TUI deferral, missed-Enter retry, headless dispatch, notification safety,
-argument boundaries, path safety, and explicit session rebind. CI runs every
-supported Python minor version from 3.10 through 3.14.
+signals, worker death, queue capability and failure paths, acceptance
+uncertainty, duplicate suppression, guarded migration, concurrent starts and
+deliveries, tmux viewer failure, busy-TUI deferral, missed-Enter retry,
+headless dispatch, notification safety, argument boundaries, path safety, and
+explicit session rebind. CI runs every supported Python minor version from
+3.10 through 3.14.
 
 ## License
 

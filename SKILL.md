@@ -75,8 +75,13 @@ mean the cancellation signal took effect.
 
 ## Choose delivery behavior
 
-- Use `auto` by default. It selects TUI delivery when a Codex thread is known,
-  otherwise durable event-only state.
+- Use `auto` by default. When the installed Codex CLI supports `codex queue` and
+  an owner thread ID is known, it queues the completion directly to that thread
+  without depending on tmux. On older CLIs it selects the conservative TUI
+  transport. Without a thread ID it records durable event-only state.
+- Use `queue` to request the same thread-addressed transport explicitly. A
+  delivery status of `queued` means the CLI accepted the message. It does not
+  prove that the target session consumed or completed the resulting turn.
 - Use `tui` to require the originating tmux-hosted Codex CLI path. Delivery
   waits for both an idle turn and an empty composer before pasting. It never
   queues into a busy turn with `Tab`.
@@ -85,14 +90,17 @@ mean the cancellation signal took effect.
   `codex exec resume` turn. It does not promise live synchronization with an
   already-open TUI.
 
-Treat state as truth and TUI delivery as a best-effort transport. Inspect the
-state and log before claiming success; exit code zero alone does not validate
-higher-level artifacts.
+Treat state as truth and every notification transport as best effort. Inspect
+the state and log before claiming success; exit code zero alone does not
+validate higher-level artifacts. Queue timeouts and interrupted queue dispatch
+have uncertain acceptance and remain pending without automatic retransmission.
 
 ## Resume or rebind a session
 
-If the owning Codex process exits, resume the same thread in any tmux pane and
-run the following with scoped host permission from that resumed TUI:
+Queue delivery uses the owner thread ID and does not require rebind after the
+TUI process or pane changes. For a pending job using the legacy TUI transport,
+resume the same thread in any tmux pane and run the following with scoped host
+permission from that resumed TUI:
 
 ```bash
 "$SKILL_ROOT/scripts/codex-long-jobs" rebind --all
@@ -102,6 +110,21 @@ Use `--name NAME` to bind one job. Rebind refuses a different
 `CODEX_THREAD_ID`. It can update an active job before completion or retry a
 pending terminal notification afterward. Merely reopening the same tmux pane
 does not prove thread identity and is insufficient without rebind.
+
+After an old worker and its delivery worker have exited, migrate a pending TUI
+notification whose durable reason proves that no prompt was pasted:
+
+```bash
+"$SKILL_ROOT/scripts/codex-long-jobs" retry-delivery \
+  --name NAME \
+  --use-queue
+```
+
+The command refuses migration while a legacy delivery worker still owns the
+per-job lock. Do not migrate an active old worker because reinstalling does not
+replace its loaded runtime. Do not use `--allow-possible-duplicate` unless the
+user has inspected the owner thread and explicitly accepts a possible duplicate
+message.
 
 Do not switch the live TUI to `/new` or another resumed thread while relying on
 an old binding; Codex CLI currently exposes no stable in-process thread-change

@@ -22,18 +22,22 @@ version from 3.10 through 3.14. The current suite covers:
    path rejection, invalid regex rejection, and startup rollback.
 4. Exact argv boundaries for spaces, shell-like text, and embedded newlines.
 5. Concurrent duplicate starts and cross-job TUI delivery serialization.
-6. Busy TUI deferral, empty-composer validation, missed Enter retry, persistent
+6. Queue capability detection, legacy fallback, missing TUI context, accepted
+   queueing, command failure, timeout uncertainty, interrupted dispatch,
+   duplicate suppression, and guarded migration of pending TUI notifications.
+7. Busy TUI deferral, empty-composer validation, missed Enter retry, persistent
    Enter failure, completion tokens wrapped across indented composer lines,
    delivery timeout, retry, and thread-isolated rebind.
-7. Disposable tmux viewer failure and recreation behavior.
-8. Event-only, direct TUI, and explicitly selected headless delivery paths.
-9. Cancellation before launch, process-group termination, `SIGTERM` to
+8. Disposable tmux viewer failure and recreation behavior.
+9. Queue, event-only, direct TUI, and explicitly selected headless delivery
+   paths.
+10. Cancellation before launch, process-group termination, `SIGTERM` to
    `SIGKILL` escalation, supervisor loss, worker loss, natural-completion races,
    idempotent terminal cancellation, and one cancelled completion prompt.
-10. Desktop notification minimization, completion path escaping, corrupt-state
+11. Desktop notification minimization, completion path escaping, corrupt-state
     reporting, status JSON, doctor output, log tailing, version consistency, and
     viewer-name uniqueness.
-11. Release installation dry runs, fixed-commit worktrees, safe destination
+12. Release installation dry runs, fixed-commit worktrees, safe destination
     replacement, upgrades, private receipts, and drift detection.
 
 The coverage harness uses coverage.py subprocess instrumentation because the
@@ -71,8 +75,23 @@ shellcheck scripts/codex-long-jobs scripts/*.sh
 
 ## Real Codex TUI acceptance
 
-Run this layer from a disposable job name in a real Codex CLI TUI hosted by
-tmux. Preserve the state and log as evidence.
+Run this layer with an isolated Codex thread and disposable job names. Preserve
+the state and log as evidence, and never send acceptance traffic to an active
+project thread.
+
+For queue delivery:
+
+1. Queue a completion to an idle persistent TUI and confirm a new turn starts
+   and completes.
+2. Keep the TUI busy with a bounded command, queue a second message, and confirm
+   it starts only after the active turn completes.
+3. Exit the isolated TUI, queue another message by thread UUID, and confirm the
+   persistent daemon consumes it without tmux.
+4. Confirm the queue command returns promptly and document that exit code zero
+   proves acceptance only. A one-shot `codex exec` client can close after its
+   first turn and abort an accepted follow-up.
+
+For compatibility TUI delivery:
 
 1. Start a short TUI-delivered job while Codex is actively working. Confirm the
    job reaches terminal state with delivery still pending and reason
@@ -94,8 +113,28 @@ tmux. Preserve the state and log as evidence.
    `cancelled`, and exactly one cancellation prompt wakes the owning TUI.
 
 Real TUI acceptance is version-sensitive because Codex currently provides no
-stable public idle-wake API. Repeat it after meaningful Codex CLI rendering or
-input changes.
+stable cross-version wake contract. Repeat queue acceptance after meaningful
+Codex queue or daemon changes, and repeat input-injection acceptance after TUI
+rendering changes.
+
+## Recorded v0.4.0 queue acceptance
+
+The queue transport passed on Linux with Codex CLI 0.157.1 on 2026-09-26:
+
+1. An idle persistent TUI consumed the queued message and completed its turn.
+2. A message queued during a 15-second active turn returned in 0.20 seconds and
+   was consumed after the active turn completed.
+3. After `/exit` terminated the isolated TUI and its disposable tmux server,
+   the app-server daemon consumed and completed another queued message.
+4. A one-shot `codex exec` session accepted a busy follow-up in 0.22 seconds and
+   created its turn after the first turn, but client shutdown immediately
+   aborted that follow-up. This confirms that command success is an acceptance
+   acknowledgement, not a consumption acknowledgement.
+
+The shared production daemon was not stopped for failure testing. Deterministic
+fake-CLI tests cover daemon-style nonzero failure, retry after recovery, timeout
+uncertainty, restart recovery, and duplicate suppression without affecting live
+sessions.
 
 ## Recorded v0.2.0 host acceptance
 
