@@ -117,6 +117,14 @@ class RuntimeTests(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"delivery reason did not reach {sorted(expected)}: {name}")
 
+    def wait_for_file(self, path: Path, timeout: float = 8) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.is_file():
+                return
+            time.sleep(0.01)
+        self.fail(f"expected file was not created: {path}")
+
     def start(
         self, name: str, code: str, *extra: str, env: dict[str, str] | None = None
     ) -> dict:
@@ -1054,12 +1062,10 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertNotEqual(retry.returncode, 0)
         self.assertIn("queue acceptance is uncertain", retry.stderr)
+        attempts_path = fake_root / "queue-attempts.jsonl"
+        self.wait_for_file(attempts_path)
         self.assertEqual(
-            len(
-                (fake_root / "queue-attempts.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-            ),
+            len(attempts_path.read_text(encoding="utf-8").splitlines()),
             1,
         )
 
