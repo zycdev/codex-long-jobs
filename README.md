@@ -12,18 +12,20 @@ for process completion with no LLM polling. When the command exits, the worker
 can wake the original Codex session through `codex queue`, with conservative
 tmux-hosted TUI delivery retained for older Codex CLI versions.
 
-- Detached and async job execution on Linux servers and over SSH, independent
-  of the optional tmux viewer.
+- Detached and async job execution on Linux servers and over SSH.
 - No LLM/model polling while a command is running.
 - Event-driven completion notification on success, failure, or abnormal exit.
 - Thread-addressed wake-up through `codex queue`, independent of tmux pane
   identity when the installed CLI supports it.
 - Safe tmux-based compatibility delivery, with same-thread resume and rebind.
 - Durable job state, logs, exit code, signal, and delivery status.
-- An optional tmux log viewer that never owns the supervised process.
+- Persistent log files and a log-following command for use in any terminal or IDE.
 
 > Status: `v0.4.0` beta. Linux is the primary tested platform. Python 3.10 or
 > newer is required.
+
+tmux is not required for job execution, log inspection, or completion delivery through `codex queue`.
+It is an optional dependency for the legacy TUI notification transport and the convenience tmux viewer.
 
 ## Why codex-long-jobs? Run long-running processes without model polling
 
@@ -133,9 +135,8 @@ polling.
 - **Session recovery.** Queue delivery continues by owner thread UUID. A pending
   compatibility TUI job can be rebound after the original thread is resumed in
   the same or a different tmux pane.
-- **Persistent inspection.** State, logs, exit information, and delivery status
-  remain available through `status`, `tail`, and an optional disposable tmux
-  viewer.
+- **Persistent inspection.** State, exit information, delivery status, and log paths remain available through `status`.
+  Follow logs with the skill's `tail` command or open the log file in any terminal or IDE.
 
 ## Use cases for Codex background jobs on Linux and SSH
 
@@ -149,15 +150,19 @@ Codex without polling. Typical uses include:
 - simulations, migrations, package installation, and environment setup;
 - large code generation, compilation, packaging, and deployment pipelines.
 
-The primary environment is a Linux server reached over SSH. Current Codex CLI
-versions can wake the owner thread through the local app-server daemon. tmux is
-needed only for the compatibility TUI transport and optional log viewer.
+The primary environment is a Linux server reached over SSH. Supported Codex CLI versions can wake the owner thread through the local app-server daemon without tmux.
+Log inspection is independent of the notification transport and the window used to view the file.
 
 ## Install the Codex skill
 
-Python 3.10 or newer is required. tmux is optional when `codex queue` is
-available. It remains required for compatibility TUI delivery and the optional
-log viewer. Install tmux with one of these methods:
+Python 3.10 or newer is required.
+Automatic queue delivery also requires a supported Codex CLI, an owner thread ID, and access to the corresponding app-server daemon.
+Use `--viewer none` to run without a managed log-viewing window; log files and the `tail` command remain available.
+
+<details>
+<summary>Optional tmux setup for legacy TUI delivery or the convenience viewer</summary>
+
+Install tmux only if you want either of these optional features:
 
 ```bash
 # Ubuntu or Debian
@@ -173,7 +178,7 @@ brew install tmux
 pixi global install --channel conda-forge tmux
 ```
 
-Verify the installation, start a tmux session, and launch Codex inside it:
+For legacy TUI delivery, verify the installation, start a tmux session, and launch Codex inside it:
 
 ```bash
 tmux -V
@@ -182,8 +187,7 @@ tmux new-session -s codex
 
 Then run `codex` from the shell inside the new tmux session.
 
-Without tmux, detached execution, durable state, and queue delivery remain
-available on supported Codex CLI versions.
+</details>
 
 From an existing Codex session, a new user can ask Codex to perform the
 installation:
@@ -217,8 +221,7 @@ Private job state defaults to `${CODEX_HOME:-$HOME/.codex}/long-jobs`.
 
 ## Codex CLI example: run deep learning model training in the background
 
-For example, ask a tmux-hosted OpenAI Codex CLI session to launch a multi-hour
-deep learning training run:
+For example, ask an OpenAI Codex CLI session to launch a multi-hour deep learning training run:
 
 ```text
 Run my model training with $codex-long-jobs without model polling. Wake this
@@ -235,7 +238,7 @@ SKILL_ROOT="${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs"
   --log ./logs/train-model-run-01.log \
   --success-pattern '^TRAINING_COMPLETE$' \
   --delivery auto \
-  --viewer auto \
+  --viewer none \
   -- bash -c '
     python train.py \
       --config configs/train.yaml \
@@ -269,7 +272,7 @@ scripts/codex-long-jobs tail --name train-model-run-01
 # Request cancellation and wait for durable terminal state
 scripts/codex-long-jobs cancel --name train-model-run-01
 
-# Create or restore the disposable tmux log viewer
+# Optional: create or restore the convenience tmux log viewer
 scripts/codex-long-jobs view --name train-model-run-01
 
 # Rebind jobs after resuming the same original Codex thread
@@ -286,6 +289,17 @@ scripts/codex-long-jobs retry-delivery \
 # Inspect runtime and TUI binding prerequisites
 scripts/codex-long-jobs doctor
 ```
+
+The launcher and `status` print the log file path; `status --json` exposes it in the `log` field.
+Open that file in your preferred terminal or IDE, or inspect the example job directly:
+
+```bash
+tail -n 200 -F ./logs/train-model-run-01.log
+less ./logs/train-model-run-01.log
+```
+
+These commands require no tmux session.
+The optional `view` command creates a tmux window for convenience; closing a log viewer does not stop the job or remove its log.
 
 For a shorter user-facing workflow, ask Codex:
 
@@ -488,12 +502,12 @@ The detached worker waits locally for process exit and checks only durable local
 cancellation state while Codex is inactive. Only actual process completion and
 successful prompt delivery start the next normal Codex turn.
 
-### Does it work with the Codex VS Code extension?
+### Does it work with the Codex desktop client or VS Code extension?
 
-No live UI synchronization claim is made for the Codex VS Code extension.
-Queue delivery targets the Codex thread through the local app-server daemon;
-whether a particular extension UI repaints that thread is outside the tested
-contract. Event-only execution remains independent of extension UI behavior.
+Desktop-client and VS Code extension compatibility has not been validated.
+Removing the tmux requirement does not by itself establish support for these clients.
+Validation must confirm that a queued message reaches the owning session, starts the expected continuation, and appears in the client, including behavior after the client closes.
+Queue acceptance alone does not establish these results.
 
 ## Safety and limitations for detached Codex jobs
 
