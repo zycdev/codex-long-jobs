@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import selectors
+import shlex
 import shutil
 import signal
 import stat
@@ -32,7 +33,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 SCHEMA_VERSION = 1
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 THREAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,160}$")
@@ -1684,6 +1685,7 @@ def command_start(args: argparse.Namespace) -> int:
     print(f"job={name}")
     print(f"supervisor_pid={supervisor_pid}")
     print(f"log={log_path}")
+    print(f"log_follow={log_follow_command(log_path)}")
     print(f"state={state_file(name)}")
     print(f"delivery_mode={mode}")
     print(f"delivery_reason={selection_reason}")
@@ -1695,6 +1697,10 @@ def command_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def log_follow_command(path: str | Path) -> str:
+    return shlex.join(["tail", "-n", "200", "-F", "--", str(path)])
+
+
 def render_status(record: dict[str, Any]) -> str:
     delivery = record.get("delivery", {})
     rows = [
@@ -1702,6 +1708,7 @@ def render_status(record: dict[str, Any]) -> str:
         f"status={record['status']}",
         f"exit_code={record.get('exit_code', 'pending')}",
         f"log={record['log']}",
+        f"log_follow={log_follow_command(record['log'])}",
         f"state={state_file(record['name'])}",
         f"delivery_mode={delivery.get('mode', 'unknown')}",
         f"delivery_status={delivery.get('status', 'unknown')}",
@@ -2020,7 +2027,12 @@ def parser() -> argparse.ArgumentParser:
         choices=["auto", "queue", "tui", "headless", "event-only"],
         default="auto",
     )
-    start.add_argument("--viewer", choices=["auto", "tmux", "none"], default="auto")
+    start.add_argument(
+        "--viewer",
+        choices=["auto", "tmux", "none"],
+        default="none",
+        help="optional log viewer (default: none; auto uses tmux inside tmux)",
+    )
     start.add_argument("--delivery-wait-seconds", type=positive_int, default=86400)
     start.add_argument("--no-desktop-notify", action="store_true")
     start.add_argument("command", nargs=argparse.REMAINDER)

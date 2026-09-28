@@ -158,6 +158,7 @@ Log inspection is independent of the notification transport and the window used 
 Python 3.10 or newer is required.
 Automatic queue delivery also requires a supported Codex CLI, an owner thread ID, and access to the corresponding app-server daemon.
 Use `--viewer none` to run without a managed log-viewing window; log files and the `tail` command remain available.
+The default viewer is `none`, including inside tmux. Explicit `--viewer tmux` creates a viewer; explicit `--viewer auto` retains the previous environment-based selection.
 
 <details>
 <summary>Optional tmux setup for legacy TUI delivery or the convenience viewer</summary>
@@ -252,8 +253,9 @@ Codex must run `start` with scoped host permission. Its normal tool sandbox
 reaps detached descendants when the tool call ends, so the controller detects
 that condition and refuses to report a false detached launch.
 
-The command prints the supervisor PID, log path, durable state path, delivery
-mode, and optional viewer attach command. After a one-time running-state check,
+The command prints the supervisor PID, log path, log-following command, durable state path, and delivery mode.
+An attach command is included only when an explicitly selected viewer starts successfully.
+After a one-time running-state check,
 let the Codex turn end. The local worker handles process completion. Success
 patterns use multiline regular-expression semantics, so `^TRAINING_COMPLETE$`
 matches one complete log line after any earlier output. In this example, the
@@ -291,6 +293,7 @@ scripts/codex-long-jobs doctor
 ```
 
 The launcher and `status` print the log file path; `status --json` exposes it in the `log` field.
+Text output also provides a shell-quoted `log_follow` command that can be copied into any terminal on the job host.
 Open that file in your preferred terminal or IDE, or inspect the example job directly:
 
 ```bash

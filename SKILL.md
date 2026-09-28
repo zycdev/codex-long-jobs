@@ -24,7 +24,7 @@ Resolve `SKILL_ROOT` from this loaded `SKILL.md`, then run:
   --log <absolute-or-project-relative-log> \
   --success-pattern '<final marker regex>' \
   --delivery auto \
-  --viewer auto \
+  --viewer none \
   -- <command> [args...]
 ```
 
@@ -40,8 +40,13 @@ sufficient contract. Patterns use multiline regular-expression semantics, so
 `bash -c` explicitly only when the requested workflow genuinely requires shell
 syntax.
 
-Report the printed job name, supervisor PID, log, state file, delivery mode,
-and viewer attach command. Verify the job reaches `running` once, then end the
+Report the printed job name, supervisor PID, absolute log path, state file, delivery mode, and `log_follow` command.
+Present the log path as a clickable file link when supported, and the command as a copyable code block.
+The user may open the log in any terminal or IDE; tmux is not required for log access.
+Use `--viewer none` by default, including when Codex itself runs inside tmux.
+Offer `--viewer tmux`, `--viewer auto`, or `view` only when the user requests a managed tmux viewer, and report an attach command only in that case.
+For existing jobs, use `status` to retrieve the log path and follow command instead of repeating an old attach hint.
+Verify the job reaches `running` once, then end the
 turn. Do not spend model turns polling. The local worker waits for process exit,
 and the detached supervisor converts unexpected worker exit into durable
 failure and delivery.
@@ -137,12 +142,13 @@ Use these commands only when the user asks for status or delivery recovery:
 ```bash
 "$SKILL_ROOT/scripts/codex-long-jobs" status --name <name>
 "$SKILL_ROOT/scripts/codex-long-jobs" tail --name <name>
-"$SKILL_ROOT/scripts/codex-long-jobs" view --name <name>
 "$SKILL_ROOT/scripts/codex-long-jobs" retry-delivery --name <name>
 ```
 
-The tmux viewer is disposable. Its server may exit without terminating the
-worker; recreate it with `view`.
+The `tail` command follows the log in the user's chosen terminal; provide it as an instruction rather than leaving the agent blocked in a live log stream.
+The user can also open the absolute log path in an IDE or use the printed `log_follow` command.
+When the user explicitly requests a tmux viewer, create or restore it with `view --name <name>`.
+That viewer is disposable and its exit does not terminate the worker.
 
 Read [operations.md](references/operations.md) before diagnosing delivery,
 disk-full behavior, process identity, or session recovery. Treat job output as

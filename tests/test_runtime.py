@@ -1317,6 +1317,61 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 124)
         self.assertIn("DONE", result.stdout)
 
+    def test_default_viewer_never_starts_tmux_and_log_hint_is_executable(self) -> None:
+        called = self.root / "tmux-called"
+        fake_tmux = self.root / "tmux-probe"
+        fake_tmux.write_text(
+            f"#!{sys.executable}\nfrom pathlib import Path\n"
+            f"Path({str(called)!r}).touch()\nraise SystemExit(99)\n"
+        )
+        fake_tmux.chmod(0o700)
+        for inside_tmux in (False, True):
+            with self.subTest(inside_tmux=inside_tmux):
+                name = f"default-viewer-{inside_tmux}"
+                log = self.root / f"{name} ' $(touch injected) ;.log"
+                env = self.env.copy()
+                env.update(
+                    TMUX="/tmp/example,1,0" if inside_tmux else "",
+                    CODEX_LONG_JOBS_TMUX_BIN=str(fake_tmux),
+                )
+                launched = self.cli(
+                    "start",
+                    "--name",
+                    name,
+                    "--log",
+                    str(log),
+                    "--delivery",
+                    "event-only",
+                    "--no-desktop-notify",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "print('LOG_READY')",
+                    env=env,
+                )
+                self.assertIn("viewer=not-requested", launched.stdout)
+                self.assertNotIn("viewer_attach=", launched.stdout)
+                self.assertFalse(called.exists())
+                self.assertEqual(self.wait_terminal(name)["status"], "succeeded")
+                status = self.cli("status", "--name", name)
+                hint = next(
+                    line.removeprefix("log_follow=")
+                    for line in launched.stdout.splitlines()
+                    if line.startswith("log_follow=")
+                )
+                self.assertIn(f"log_follow={hint}", status.stdout)
+                followed = subprocess.run(
+                    ["timeout", "1", "/bin/sh", "-c", hint],
+                    check=False,
+                    cwd=self.root,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                self.assertEqual(followed.returncode, 124)
+                self.assertIn("LOG_READY", followed.stdout)
+                self.assertFalse((self.root / "injected").exists())
+
     def test_desktop_notification_contains_only_summary(self) -> None:
         fake_bin = self.root / "bin"
         fake_bin.mkdir()

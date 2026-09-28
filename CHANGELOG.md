@@ -5,6 +5,11 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Default to no managed log viewer, including inside tmux, and provide a shell-quoted `log_follow` command alongside the log path in start and status output.
+- Make file paths and terminal-independent log access the default Skill guidance; retain explicitly requested tmux viewers.
+
 ## [0.4.0] - 2026-09-27
 
 ### Added

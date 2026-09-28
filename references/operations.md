@@ -22,6 +22,11 @@ stdout and stderr to the configured log, checks durable cancellation state,
 records terminal state atomically, and then invokes the delivery layer. No
 model call or Codex turn occurs while the command is merely running.
 
+Log inspection uses the persistent file path and the `tail` command independently of tmux.
+The default `--viewer none` creates no viewing window, even when the launcher runs inside tmux.
+Human-readable start and status output include a shell-quoted `log_follow` command for any terminal on the job host; JSON status retains the `log` path.
+Explicit `--viewer tmux`, `--viewer auto`, and `view` remain available for users who request a managed tmux viewer.
+
 If the worker exits before terminal state, the supervisor terminates the
 validated child process group, records `worker-exit` or `worker-signal`, and
 invokes delivery. The supervisor is deliberately separate from the tmux viewer.
