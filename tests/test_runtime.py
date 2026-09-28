@@ -117,14 +117,6 @@ class RuntimeTests(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"delivery reason did not reach {sorted(expected)}: {name}")
 
-    def wait_for_file(self, path: Path, timeout: float = 8) -> None:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if path.is_file():
-                return
-            time.sleep(0.01)
-        self.fail(f"expected file was not created: {path}")
-
     def start(
         self, name: str, code: str, *extra: str, env: dict[str, str] | None = None
     ) -> dict:
@@ -1056,18 +1048,22 @@ class RuntimeTests(unittest.TestCase):
             "queue-timeout", {"queue-command-timeout-acceptance-unknown"}
         )
         self.assertTrue(record["delivery"]["queue_acceptance_uncertain"])
+        self.assertEqual(record["delivery"]["queue_attempts"], 1)
+        # Timeout can terminate the CLI before it creates its dispatch log.
+        attempts_path = fake_root / "queue-attempts.jsonl"
+        attempts_before = attempts_path.read_bytes() if attempts_path.exists() else None
 
         retry = self.cli(
             "retry-delivery", "--name", "queue-timeout", env=env, check=False
         )
         self.assertNotEqual(retry.returncode, 0)
         self.assertIn("queue acceptance is uncertain", retry.stderr)
-        attempts_path = fake_root / "queue-attempts.jsonl"
-        self.wait_for_file(attempts_path)
-        self.assertEqual(
-            len(attempts_path.read_text(encoding="utf-8").splitlines()),
-            1,
+        after_retry = json.loads(
+            (self.state / "jobs" / "queue-timeout" / "state.json").read_text()
         )
+        self.assertEqual(after_retry["delivery"], record["delivery"])
+        attempts_after = attempts_path.read_bytes() if attempts_path.exists() else None
+        self.assertEqual(attempts_after, attempts_before)
 
     def test_interrupted_queue_dispatch_recovers_without_resending(self) -> None:
         thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
