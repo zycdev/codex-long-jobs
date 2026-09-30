@@ -5,6 +5,10 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Add configurable, notification-only release checks on skill use, enabled weekly by default, with persistent attempt throttling and preserved preferences across installations.
+
 ### Changed
 
 - Default to no managed log viewer, including inside tmux, and provide a shell-quoted `log_follow` command alongside the log path in start and status output.

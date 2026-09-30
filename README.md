@@ -220,6 +220,22 @@ is run again. Use `--ref TAG_OR_COMMIT` to pin or roll back explicitly.
 Restart Codex, then confirm the skill appears in `/skills`.
 Private job state defaults to `${CODEX_HOME:-$HOME/.codex}/long-jobs`.
 
+## Update notifications
+
+New installations enable release checks once per week and explain how to change this setting.
+Checks occur on skill use only after the configured interval has elapsed since installation or the previous attempt.
+A newer release produces a notification; installation always requires an explicit user request.
+Network failures do not block job operations, and existing preferences survive reinstallation.
+
+```bash
+SKILL_ROOT="${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs"
+python3 "$SKILL_ROOT/scripts/check_updates.py" status
+python3 "$SKILL_ROOT/scripts/check_updates.py" configure --enabled no
+python3 "$SKILL_ROOT/scripts/check_updates.py" configure --enabled yes --interval 2w
+```
+
+See [release checks and manual updates](references/updates.md) for installation initialization, timing, and update procedures.
+
 ## Codex CLI example: run deep learning model training in the background
 
 For example, ask an OpenAI Codex CLI session to launch a multi-hour deep learning training run:

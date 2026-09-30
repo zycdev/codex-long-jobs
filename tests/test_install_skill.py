@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -28,15 +29,18 @@ class InstallSkillTests(unittest.TestCase):
             "---\nname: codex-long-jobs\ndescription: test\n---\n\n# Test\n",
             encoding="utf-8",
         )
+        (self.repo / "scripts").mkdir()
+        shutil.copy2(SOURCE.parent / "check_updates.py", self.repo / "scripts")
         self.git("init", "-b", "main")
         self.git("config", "user.name", "Test")
         self.git("config", "user.email", "test@example.invalid")
-        self.git("add", "SKILL.md")
+        self.git("add", "SKILL.md", "scripts")
         self.git("commit", "-m", "initial")
         self.environment = mock.patch.dict(
             os.environ,
             {
                 "HOME": str(self.root / "home"),
+                "CODEX_HOME": str(self.root / "home" / ".codex"),
                 "CODEX_LONG_JOBS_INSTALL_STATE_DIR": str(self.root / "state"),
             },
             clear=False,
@@ -83,13 +87,27 @@ class InstallSkillTests(unittest.TestCase):
         self.assertEqual(receipt["commit"], commit)
         self.assertTrue(INSTALLER.verify(None)["ok"])
 
+    def test_install_initializes_checks_and_preserves_disabled_setting(self) -> None:
+        result = INSTALLER.install("main", None, True)
+        config = json.loads(result["update_checks"])
+        self.assertTrue(config["enabled"])
+        self.assertEqual(config["interval_seconds"], 604800)
+        path = Path(config["config"])
+        saved = json.loads(path.read_text())
+        saved["enabled"] = False
+        saved["interval_seconds"] = 3600
+        path.write_text(json.dumps(saved))
+        result = INSTALLER.install("main", None, True)
+        self.assertFalse(json.loads(result["update_checks"])["enabled"])
+        self.assertEqual(json.loads(path.read_text()), saved)
+
     def test_reinstall_moves_release_to_new_commit(self) -> None:
         INSTALLER.install("main", None, True)
         skill = self.repo / "SKILL.md"
         skill.write_text(
             skill.read_text(encoding="utf-8") + "updated\n", encoding="utf-8"
         )
-        self.git("add", "SKILL.md")
+        self.git("add", "SKILL.md", "scripts")
         self.git("commit", "-m", "update")
         updated = self.git("rev-parse", "main")
         INSTALLER.install("main", None, True)

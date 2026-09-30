@@ -14,6 +14,22 @@ Typical triggers include "run this in the background," "this will take a long
 time," "don't poll it," "run tests in the background," "start the build and
 continue when complete," and "wake me when the process finishes."
 
+## Release update checks
+
+On installation, including a copied installation, run `python3 "$SKILL_ROOT/scripts/check_updates.py" init`.
+Tell the user that release checks default to once per week and can be disabled with `configure --enabled no` or rescheduled with `configure --interval 1d` (positive integer hours, days, or weeks, such as `12h`, `7d`, or `2w`).
+Initialization preserves existing preferences; the bundled installer performs it automatically.
+
+Whenever using this skill, run `python3 "$SKILL_ROOT/scripts/check_updates.py" check` once.
+Use scoped host permission if required to write the configuration or reach GitHub; if permission is unavailable, continue the requested work.
+The script performs network access only when enabled and the configured interval has elapsed since the last attempt, or installation if no attempt exists.
+It records failed attempts too, and never runs a background timer or model polling loop.
+If the result is `update-available`, briefly report the installed version, available version, and release link.
+An update notification is not authorization to install: update only after an explicit user request.
+For other results, continue the requested work without an update prompt; a failed or sandbox-blocked check must not delay or prevent job operations.
+Do not bypass the interval with a separate web query or retry a recorded failed automatic check.
+Read [updates.md](references/updates.md) for configuration and manual update instructions.
+
 ## Start a job
 
 Resolve `SKILL_ROOT` from this loaded `SKILL.md`, then run:

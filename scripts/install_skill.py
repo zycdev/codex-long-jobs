@@ -282,6 +282,18 @@ def install(ref: str, names: Sequence[str] | None, apply: bool) -> dict[str, obj
     save_receipt(ref, commit, targets)
     result["commit"] = commit
     result["applied"] = True
+    update_checker = source / "scripts" / "check_updates.py"
+    if update_checker.is_file():
+        initialized = subprocess.run(
+            [sys.executable, str(update_checker), "init"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        result["update_checks"] = (
+            initialized.stdout.strip() or initialized.stderr.strip()
+        )
     return result
 
 
