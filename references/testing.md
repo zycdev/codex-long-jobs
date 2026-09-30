@@ -193,3 +193,48 @@ Tests cover independent log access inside and outside tmux, shell-safe log comma
 An isolated real GitHub request returned the published release, and an immediate second invocation returned `not-due` without a second request.
 The installed skill passed installation verification and all 11 update-check tests.
 No production job or notification state was changed.
+
+## Recorded VS Code Remote-SSH acceptance
+
+On 2026-09-30, skill v0.4.1 was exercised in the Codex VS Code extension (`openai.chatgpt` version `26.917.62051`) on a Linux Remote-SSH host.
+The extension used its bundled `codex app-server`; the skill resolved system `codex-cli 0.157.1` through PATH.
+The resumed tool environment identified `codex_vscode` and the same owner thread, with an extension-host process ancestry.
+All test jobs used CPU-only commands, `--delivery auto`, and `--viewer none`.
+No production job was modified.
+
+| Scenario | Verified outcome |
+| --- | --- |
+| Idle session | Successful artifact and exit; completion message triggered the original thread; user confirmed message and reply display. |
+| Busy session | Artifact completion and queue acceptance occurred during a bounded active command; the completion message triggered a subsequent turn without interrupting the original turn. |
+| Two near-simultaneous completions | Both artifacts were correct; each notification had one queue attempt and each triggered a continuation. |
+| Switch to another conversation | Original thread received the notification; user confirmed no misrouting and the reply was visible on return. |
+| Close and reopen chat panel | Successful artifact, one queue attempt, and continuation; user confirmed the panel was closed during completion and messages were visible on reopening. |
+| Close and reopen project window | Job completed and queue acceptance preceded reopening; the user observed `steer`, then conversation history and continuation on reopening. |
+| Close Remote Connection and reconnect | Job completed and queue acceptance preceded reconnection; the user observed `steer` and continuation on reconnecting. |
+| Intentional failure | Exit code 7 and `failed` state matched the artifact; one queue attempt triggered a failure continuation. |
+| Explicit cancellation | Controller cancellation became effective with SIGTERM; the test child exited, the natural-completion artifact was absent, and one queue attempt triggered a cancellation continuation. |
+
+For the project-window test, completion and queue acceptance occurred at 05:12:31 UTC; the user reported reopening at approximately 05:15 UTC.
+For the Close Remote Connection test, completion and queue acceptance occurred at 05:45:05 UTC; the user reported the `steer` transition on reconnecting, and the continuation verified artifacts at 05:51:04 UTC.
+These observations establish recovery after reconnection but do not establish model execution while the window or connection was closed.
+The transient `steer` display did not prevent consumption in either test; no stronger interpretation of that UI label was established.
+
+Two preliminary panel-close attempts lacked the required user action or confirmation and were excluded from panel-close acceptance.
+A separate attempted disconnect occurred before any job was launched and was also excluded.
+The final panel-close and Close Remote Connection tests included confirmed running jobs and explicit user observations.
+
+### Reproduction and limits
+
+Use unique disposable jobs with explicit success markers and artifacts, and address only an authorized test conversation.
+Record the installed skill, PATH CLI, extension version, and owner thread before testing.
+For busy-session tests, compare recorded command, artifact, and queue timestamps; do not infer queue timing solely from rendered chat history.
+For concurrent completions, verify each artifact and each actual completion turn separately.
+For UI lifecycle tests, confirm `running` before asking the user to switch, close, or disconnect, and record the exact action and approximate reconnection time.
+Keep project-window closure and Close Remote Connection as separate scenarios.
+Verify terminal state, log, artifact, queue attempts, actual consumption, and user-visible results before declaring acceptance.
+Use a nonzero exit for failure and cancel only the disposable test through the controller for cancellation.
+
+The observations apply to this version combination and host setup, not every VS Code installation.
+Unexpected network outages, remote server termination, host reboot, and native Windows execution were not covered.
+A CLI success code remains queue acceptance only; the consumption and display findings above depend on the additional observed completion turns and user confirmation.
+Keep raw logs, conversation identifiers, and host-specific job state outside the public repository.

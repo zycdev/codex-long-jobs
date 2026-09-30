@@ -1,4 +1,4 @@
-# Codex Long Jobs: Background Jobs for OpenAI Codex CLI
+# Codex Long Jobs: Background Jobs for Codex CLI and VS Code
 
 [![CI](https://github.com/zycdev/codex-long-jobs/actions/workflows/ci.yml/badge.svg)](https://github.com/zycdev/codex-long-jobs/actions/workflows/ci.yml)
 
@@ -6,7 +6,8 @@
 the original Codex session when the process finishes.**
 
 `codex-long-jobs` is a Codex skill and local process supervisor for OpenAI
-Codex CLI. It runs long-running background jobs and other background processes
+Codex CLI and the Codex VS Code extension on tested Linux Remote-SSH hosts.
+It runs long-running background jobs and other background processes
 as detached OS processes. The current turn can end while a local worker waits
 for process completion with no LLM polling. When the command exits, the worker
 can wake the original Codex session through `codex queue`, with conservative
@@ -521,12 +522,23 @@ The detached worker waits locally for process exit and checks only durable local
 cancellation state while Codex is inactive. Only actual process completion and
 successful prompt delivery start the next normal Codex turn.
 
-### Does it work with the Codex desktop client or VS Code extension?
+### Does it work with the Codex VS Code extension?
 
-Desktop-client and VS Code extension compatibility has not been validated.
-Removing the tmux requirement does not by itself establish support for these clients.
-Validation must confirm that a queued message reaches the owning session, starts the expected continuation, and appears in the client, including behavior after the client closes.
-Queue acceptance alone does not establish these results.
+Yes, in the tested Linux Remote-SSH environment with skill v0.4.1, extension `openai.chatgpt` version `26.917.62051`, and system Codex CLI `0.157.1` providing `codex queue`.
+The extension's bundled app-server and the CLI used by the skill are distinct processes; check the CLI available in the extension tool environment rather than assuming their versions or capabilities match.
+
+Real-session validation covered idle and busy sessions, two simultaneous completions, switching conversations, closing and reopening the chat panel, closing and reopening the project window, closing and restoring the remote connection, nonzero exit, and explicit cancellation.
+Completion messages reached the original conversation and triggered continuation without tmux.
+The user confirmed interface display and recovery for the interactive scenarios.
+
+After the project window or remote connection closed, the job completed and the queue command returned success before reopening.
+The user observed the message briefly displayed as `steer` on reconnection, followed by normal conversation history and continuation.
+This establishes recovery after reconnection, not model execution while disconnected.
+Do not resend an accepted notification merely because the client has not displayed it yet.
+
+Use `--delivery auto --viewer none`, inspect `status --json`, and view the log file in any terminal or editor.
+If `doctor` reports queue delivery unavailable, use event-only operation or a separately validated TUI environment; do not inject input into the VS Code interface.
+See [VS Code acceptance and reproduction](references/testing.md#recorded-vs-code-remote-ssh-acceptance) for the tested boundaries.
 
 ## Safety and limitations for detached Codex jobs
 

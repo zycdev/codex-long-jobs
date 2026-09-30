@@ -227,6 +227,20 @@ for workloads requiring host-crash recovery.
   signaling, reducing stale process-group reuse risk.
 - Desktop notices contain only job name, terminal status, and exit code.
 
+## VS Code client recovery
+
+The tested Linux Remote-SSH extension uses queue delivery without tmux.
+The CLI found through PATH must support `codex queue`; the extension's bundled app-server does not by itself establish that capability.
+Inspect `doctor` and the recorded delivery mode when diagnosing a new installation.
+Use `event-only` if automatic queue delivery is unavailable and no validated TUI endpoint exists.
+
+After closing the project window or remote connection, the tested jobs completed and their messages were accepted before reopening.
+On reconnecting, the user observed a brief `steer` state followed by history insertion and continuation in the original conversation.
+A `queued` record must not be retried merely because the interface is closed or its message has not yet appeared.
+Reopen the original conversation and inspect its history and durable job state first.
+Model execution while the client is disconnected is not established by these tests.
+See [the VS Code acceptance record](testing.md#recorded-vs-code-remote-ssh-acceptance) for the exact scope and reproduction procedure.
+
 ## Known limitations
 
 - Linux is the primary tested platform. Detached execution is POSIX-oriented;

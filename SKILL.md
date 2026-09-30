@@ -1,18 +1,31 @@
 ---
 name: codex-long-jobs
-description: Run, supervise, or explicitly cancel long-running, background, async, or detached processes from OpenAI Codex CLI and wake or resume the owning Codex session on process completion, without LLM/model polling while the job runs. Use when asked to run something in the background, start or stop a long build, test, training job, or evaluation, not poll it, wait without wasting model turns, continue when it finishes, wake the original session, preserve logs and exit state, survive Codex or tmux viewer exit, cancel the complete job process group, or rebind after the original Codex thread restarts.
+description: Run, supervise, or explicitly cancel long-running, background, async, or detached processes from OpenAI Codex CLI or the Codex VS Code extension and wake or resume the owning Codex session on process completion, without LLM/model polling while the job runs. Use when asked to run something in the background, start or stop a long build, test, training job, or evaluation, not poll it, wait without wasting model turns, continue when it finishes, wake the original session, preserve logs and exit state, survive Codex or tmux viewer exit, cancel the complete job process group, or rebind after the original Codex thread restarts.
 ---
 
 # Codex Long Jobs
 
 Run the bundled controller for a long-running command, background process,
-detached job, or async job expected to outlive the active Codex CLI turn. Keep
+detached job, or async job expected to outlive the active Codex turn. Keep
 deterministic stages in the job command and reserve the completion turn for
 inspection, judgment, or already-authorized follow-up work.
 
 Typical triggers include "run this in the background," "this will take a long
 time," "don't poll it," "run tests in the background," "start the build and
 continue when complete," and "wake me when the process finishes."
+
+## VS Code Remote-SSH
+
+The Linux Remote-SSH extension workflow is validated with `--delivery auto --viewer none` when the CLI in the tool environment supports `codex queue` and the owner thread ID is available.
+Check `doctor` before first use in a new client environment; the system CLI and extension-bundled app-server may differ.
+If queue delivery is unavailable, explain that automatic VS Code continuation is not established and use `event-only` when appropriate; never inject input into the extension UI.
+Use log paths and follow commands in any terminal or editor.
+
+After the project window or remote connection closes, a job can finish and its notification can be accepted before the user reconnects.
+The tested client consumed and displayed the notification on reopening, sometimes briefly showing `steer`.
+Do not promise model execution while disconnected or retry a `queued` notification merely because it is not yet visible.
+Inspect the original thread and durable state first; switching conversations does not change the job's owner.
+Read [VS Code acceptance](references/testing.md#recorded-vs-code-remote-ssh-acceptance) for the tested environment and recovery boundaries.
 
 ## Release update checks
 
