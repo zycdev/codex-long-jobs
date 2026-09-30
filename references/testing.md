@@ -184,3 +184,12 @@ The preserved acceptance evidence is job
 3. Process completion does not prove semantic artifact correctness. Completion
    messages require Codex to inspect the state, log, and requested artifacts.
 4. Native Windows is outside the supported runtime contract.
+
+## Recorded v0.4.1 acceptance
+
+On 2026-09-30, the final implementation passed 93 tests with 83.78% subprocess-aware branch coverage on the Linux host.
+Ruff, formatting, and the OpenAI Skill validator passed.
+Tests cover independent log access inside and outside tmux, shell-safe log commands, default weekly release checks, exact interval boundaries, disabled checks, preserved installation preferences, concurrent callers, failed and interrupted requests, and numeric release comparison.
+An isolated real GitHub request returned the published release, and an immediate second invocation returned `not-due` without a second request.
+The installed skill passed installation verification and all 11 update-check tests.
+No production job or notification state was changed.

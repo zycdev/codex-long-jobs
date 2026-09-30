@@ -5,6 +5,8 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-30
+
 ### Added
 
 - Add configurable, notification-only release checks on skill use, enabled weekly by default, with persistent attempt throttling and preserved preferences across installations.
