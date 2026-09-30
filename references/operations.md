@@ -238,6 +238,9 @@ After closing the project window or remote connection, the tested jobs completed
 On reconnecting, the user observed a brief `steer` state followed by history insertion and continuation in the original conversation.
 A `queued` record must not be retried merely because the interface is closed or its message has not yet appeared.
 Reopen the original conversation and inspect its history and durable job state first.
+If a connection failure or backend error requires Reload Window, restore the connection or reload, then inspect the original conversation before retrying delivery.
+Client-side proxy failure, extension app-server termination, and Server main-process termination recovered this way in the tested environment.
+These findings do not establish recovery from recursive process-tree loss, shared Codex daemon termination, or server-side network loss.
 Model execution while the client is disconnected is not established by these tests.
 See [the VS Code acceptance record](testing.md#recorded-vs-code-remote-ssh-acceptance) for the exact scope and reproduction procedure.
 

@@ -211,6 +211,9 @@ No production job was modified.
 | Close and reopen chat panel | Successful artifact, one queue attempt, and continuation; user confirmed the panel was closed during completion and messages were visible on reopening. |
 | Close and reopen project window | Job completed and queue acceptance preceded reopening; the user observed `steer`, then conversation history and continuation on reopening. |
 | Close Remote Connection and reconnect | Job completed and queue acceptance preceded reconnection; the user observed `steer` and continuation on reconnecting. |
+| Unexpected client connection failure | An incorrect PC proxy interrupted Remote-SSH before job completion. Automatic reconnection failed and requested Reload Window. After reload, the user saw the completion message and verification reply; all 12 job heartbeats and the artifact were intact. |
+| Extension app-server termination | A process-identity-checked SIGKILL terminated only the current extension backend. The job produced 12 subsequent heartbeats and a valid artifact. One queue attempt was accepted, and the original conversation continued after reopening with a new backend. |
+| VS Code Server main-process termination | A process-identity-checked SIGKILL terminated the Server main process. The detached job completed with 12 post-signal heartbeats. After the requested window reload, a new Server and extension backend consumed the single queued notification in the original thread. |
 | Intentional failure | Exit code 7 and `failed` state matched the artifact; one queue attempt triggered a failure continuation. |
 | Explicit cancellation | Controller cancellation became effective with SIGTERM; the test child exited, the natural-completion artifact was absent, and one queue attempt triggered a cancellation continuation. |
 
@@ -223,6 +226,24 @@ Two preliminary panel-close attempts lacked the required user action or confirma
 A separate attempted disconnect occurred before any job was launched and was also excluded.
 The final panel-close and Close Remote Connection tests included confirmed running jobs and explicit user observations.
 
+In the unexpected client-connection test, the PC proxy was deliberately misconfigured before 08:51 UTC while server networking remained unchanged.
+The job completed and the queue command succeeded at 08:51:26 UTC.
+VS Code reported `Cannot reconnect. Please reload the window.`; the user reloaded and confirmed the completion and reply in conversation history.
+This covers a client-side transport failure requiring window reload, not a server-side network failure.
+
+In the extension-backend test, SIGKILL was sent at approximately 09:09:19 UTC, and job completion and queue acceptance occurred at 09:11:19 UTC.
+The interface displayed `ChatGPT hit a snag`.
+The user reopened the conversation at approximately 09:17 UTC and observed the completion message in the pending-input area with a `Steer` control before continuation.
+The subsequent verification ran in the original thread under a new extension backend.
+The exact UI action used to restart the backend was not established; the screenshots alone do not prove when consumption began.
+Shared VS Code Server and Codex daemon processes were not terminated in this test.
+
+In the VS Code Server test, SIGKILL was sent only to the verified Server main process at approximately 09:24:04 UTC.
+Job completion and queue acceptance occurred at 09:26:04 UTC.
+The user reported a reload prompt and reloaded the window at approximately 09:33 UTC, then observed a brief `steer` notification followed by reply generation.
+The old Server process identity was absent, and the continuation ran under a new Server and extension backend.
+No recursive process-tree termination was performed; tmux sessions and the shared Codex daemon were not targeted.
+
 ### Reproduction and limits
 
 Use unique disposable jobs with explicit success markers and artifacts, and address only an authorized test conversation.
@@ -233,8 +254,11 @@ For UI lifecycle tests, confirm `running` before asking the user to switch, clos
 Keep project-window closure and Close Remote Connection as separate scenarios.
 Verify terminal state, log, artifact, queue attempts, actual consumption, and user-visible results before declaring acceptance.
 Use a nonzero exit for failure and cancel only the disposable test through the controller for cancellation.
+For service-failure tests, first identify process ownership and other connected windows, and confirm that no foreground task requires preservation.
+Capture and revalidate the target executable and process start time, then use a process handle to signal only the selected process.
+Record signal evidence and post-signal job output; do not substitute an entire process-group kill for a single-process test.
 
 The observations apply to this version combination and host setup, not every VS Code installation.
-Unexpected network outages, remote server termination, host reboot, and native Windows execution were not covered.
+Server-side network outages, recursive loss of the Server process tree, shared Codex daemon termination, host reboot, and native Windows execution were not covered.
 A CLI success code remains queue acceptance only; the consumption and display findings above depend on the additional observed completion turns and user confirmation.
 Keep raw logs, conversation identifiers, and host-specific job state outside the public repository.

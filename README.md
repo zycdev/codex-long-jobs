@@ -1,4 +1,4 @@
-# Codex Long Jobs: Background Jobs for Codex CLI and VS Code
+# Codex Long Jobs: Background Jobs for Codex CLI and the Codex Extension for VS Code
 
 [![CI](https://github.com/zycdev/codex-long-jobs/actions/workflows/ci.yml/badge.svg)](https://github.com/zycdev/codex-long-jobs/actions/workflows/ci.yml)
 
@@ -527,7 +527,7 @@ successful prompt delivery start the next normal Codex turn.
 Yes, in the tested Linux Remote-SSH environment with skill v0.4.1, extension `openai.chatgpt` version `26.917.62051`, and system Codex CLI `0.157.1` providing `codex queue`.
 The extension's bundled app-server and the CLI used by the skill are distinct processes; check the CLI available in the extension tool environment rather than assuming their versions or capabilities match.
 
-Real-session validation covered idle and busy sessions, two simultaneous completions, switching conversations, closing and reopening the chat panel, closing and reopening the project window, closing and restoring the remote connection, nonzero exit, and explicit cancellation.
+Real-session validation covered idle and busy sessions, two simultaneous completions, switching conversations, closing and reopening the chat panel, closing and reopening the project window, closing and restoring the remote connection, unexpected client-side connection loss, extension-backend and VS Code Server main-process termination, nonzero exit, and explicit cancellation.
 Completion messages reached the original conversation and triggered continuation without tmux.
 The user confirmed interface display and recovery for the interactive scenarios.
 

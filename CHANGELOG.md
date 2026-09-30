@@ -7,7 +7,7 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ### Documentation
 
-- Record real VS Code Remote-SSH acceptance for queue delivery, conversation routing, panel and connection recovery, failure, and cancellation.
+- Record real VS Code Remote-SSH acceptance for queue delivery, conversation routing, panel and connection recovery, unexpected client-side connection loss, extension-backend and Server main-process termination, failure, and cancellation.
 - Extend skill discovery and operating guidance to the tested VS Code environment, including the distinction between queue acceptance and continuation after reconnection.
 
 ## [0.4.1] - 2026-09-30
