@@ -195,8 +195,7 @@ From an existing Codex session, a new user can ask Codex to perform the
 installation:
 
 ```text
-Install https://github.com/zycdev/codex-long-jobs as a user Codex skill and
-tell me when it is ready.
+Install https://github.com/zycdev/codex-long-jobs as a user Codex skill and tell me when it is ready.
 ```
 
 After Codex completes the installation, the new skill is available on the next
@@ -242,8 +241,7 @@ See [release checks and manual updates](references/updates.md) for installation 
 For example, ask an OpenAI Codex CLI session to launch a multi-hour deep learning training run:
 
 ```text
-Run my model training with $codex-long-jobs without model polling. Wake this
-session when it finishes and verify the checkpoint.
+Run my model training with $codex-long-jobs without model polling. Wake this session when it finishes and verify the checkpoint.
 ```
 
 The corresponding controller command can look like this:
@@ -414,8 +412,7 @@ its Codex process identity changed. After resuming the same original thread in
 any tmux pane, send Codex this prompt:
 
 ```text
-I resumed the original Codex thread in this tmux pane. Use $codex-long-jobs to
-rebind its pending jobs to this TUI without polling them.
+I resumed the original Codex thread in this tmux pane. Use $codex-long-jobs to rebind its pending jobs to this TUI without polling them.
 ```
 
 The skill performs the equivalent controller action:
