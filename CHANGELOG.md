@@ -5,6 +5,13 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-30
+
+### Changed
+
+- Include the Codex extension for VS Code in skill discovery and provide concise client-specific operating guidance.
+- Present core job operations before client guidance and release checks, and retain detailed acceptance evidence in reference documents.
+
 ### Documentation
 
 - Record real VS Code Remote-SSH acceptance for queue delivery, conversation routing, panel and connection recovery, unexpected client-side connection loss, extension-backend and Server main-process termination, failure, and cancellation.

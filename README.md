@@ -22,7 +22,7 @@ tmux-hosted TUI delivery retained for older Codex CLI versions.
 - Durable job state, logs, exit code, signal, and delivery status.
 - Persistent log files and a log-following command for use in any terminal or IDE.
 
-> Status: `v0.4.1` beta. Linux is the primary tested platform. Python 3.10 or
+> Status: `v0.4.2` beta. Linux is the primary tested platform. Python 3.10 or
 > newer is required.
 
 tmux is not required for job execution, log inspection, or completion delivery through `codex queue`.
