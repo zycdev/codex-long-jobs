@@ -98,6 +98,13 @@ consumed or completed the new turn. Per-job locking suppresses normal duplicate
 dispatch. A timeout or interrupted invocation remains pending with uncertain
 acceptance instead of being resent automatically.
 
+After queue acceptance, a detached helper attempts to wake an unloaded owner
+through the existing local Codex daemon. It starts only the existing queued
+completion, preserves earlier input, and records the wake result separately.
+This uses an experimental, version-sensitive daemon interface; continuation is
+best effort and requires the host and daemon to remain available. See
+[unattended queue wake](references/operations.md#unattended-queue-wake).
+
 A terminal legacy TUI notification can be migrated with
 `retry-delivery --use-queue` only after its old delivery worker exits and its
 durable reason proves that no prompt was pasted. Ambiguous records require

@@ -5,6 +5,14 @@ versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Wake an unloaded owner after accepted queue delivery through its existing
+  Codex daemon, without a UI click, extra model polling, or third-party runtime
+  dependencies. Preserve queue order and avoid duplicate input after resume.
+- Store separate wake evidence and provide a wake-only recovery helper.
+- Explain how to handle an active Goal while a background job runs.
+
 ## [0.4.2] - 2026-09-30
 
 ### Changed
