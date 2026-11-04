@@ -950,8 +950,38 @@ def deliver_queue(name: str) -> None:
             queue_exit_code=0,
             queued_at=now_iso(),
         )
+        launch_queue_wake(name)
     finally:
         os.close(fd)
+
+
+def launch_queue_wake(name: str) -> None:
+    """Wake an unloaded owner after acceptance; never retransmit the prompt."""
+    directory = job_dir(name)
+    try:
+        with open_log_for_append(directory / "queue-wake.log", create=True) as handle:
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).with_name("queue_wake.py")),
+                    "--name",
+                    name,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+    except OSError as exc:
+        atomic_write_json(
+            directory / "queue-wake.json",
+            {
+                "status": "pending",
+                "reason": f"wake-launch-failed:{exc.errno}",
+                "updated_at": now_iso(),
+            },
+        )
 
 
 def launch_desktop_notification(record: dict[str, Any]) -> None:

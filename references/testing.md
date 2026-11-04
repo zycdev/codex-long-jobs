@@ -9,6 +9,30 @@ of machine reboot, loss of both supervisor and worker, or arbitrary future
 Codex TUI changes. Supervisor-only SIGKILL after the worker reaches `running`
 has a separate real-host acceptance test.
 
+## Unattended queue wake acceptance
+
+On 2026-11-01 the local patch passed 111 tests, Ruff lint and formatting,
+and the skill validator. The added tests cover the Unix WebSocket transport,
+partial frames, masking and length encodings, ping/fragmentation, unloaded
+owners, busy owners, prior queued input, queue-consumption races, detached
+launch, private wake evidence, and repeat-call idempotence.
+
+Real acceptance ran against a Codex 0.166.0 daemon with Python 3.12:
+
+1. A tiny background job completed with one accepted completion message and
+   one completed follow-up turn while the test client was disconnected. The
+   native queue consumer had already consumed this item when the helper ran;
+   the helper correctly recorded `absent` and did not duplicate it.
+2. A separate direct queue submission was verified to remain queued while its
+   owner was `notLoaded`. After closing the submitting client, the detached
+   helper resumed the owner, recorded `consumed-after-resume`, and exactly one
+   follow-up turn completed. No desktop click or selected thread was involved.
+
+Private receipts and logs remain outside the skill. Existing production jobs
+and other threads were not modified. These tests cover a live host and daemon;
+they do not establish host-reboot recovery or availability of desktop-provided
+tools after the desktop is disconnected. This does not replace the historical TUI acceptance below.
+
 ## Automated matrix
 
 GitHub Actions runs the suite on Linux with every supported Python minor

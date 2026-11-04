@@ -46,10 +46,50 @@ The user may open the log in any terminal or IDE; tmux is not required for log a
 Use `--viewer none` by default, including when Codex itself runs inside tmux.
 Offer `--viewer tmux`, `--viewer auto`, or `view` only when the user requests a managed tmux viewer, and report an attach command only in that case.
 For existing jobs, use `status` to retrieve the log path and follow command instead of repeating an old attach hint.
-Verify the job reaches `running` once, then end the
-turn. Do not spend model turns polling. The local worker waits for process exit,
+Verify the job reaches `running` once. If it belongs to an active Goal, apply
+[Goal-aware waits](#goal-aware-waits) before ending the turn. Do not spend model
+turns polling. The local worker waits for process exit,
 and the detached supervisor converts unexpected worker exit into durable
 failure and delivery.
+
+## Goal-aware waits
+
+A Goal may automatically start another turn even after the assistant ends a
+waiting turn. Ending the turn alone is not a reliable way to prevent this.
+The long-jobs controller does not manage Goal lifecycle state.
+
+Apply this workflow only to a related Goal in the owning chat. Do not create a
+Goal merely to run a background job. Inspect Goal state once if it is unknown;
+do not poll either the Goal or the experiment while waiting.
+
+- When useful independent work remains, continue that authorized work. When
+  only the external job remains, use an authorized Goal pause before yielding.
+- Explicit permission to "pause the Goal while waiting, then continue when the
+  job finishes" can cover repeated waits in the same chat. Preserve that
+  permission and do not ask again. A request to avoid polling, by itself, does
+  not authorize changing Goal state. If permission is missing, ask once and
+  explain that the Goal control requires explicit user authorization to pause.
+- After the job is verified running and its completion delivery is configured,
+  use the available Goal control to set `paused`, if authorized. Report the
+  returned state, record the job and the conditional continuation permission in
+  the handoff, and end the turn. Do not cancel the job or disable its completion
+  notification. Do not mark the objective complete or use `blocked` merely to
+  suppress automatic turns; genuine blockers follow the Goal's own rules.
+- On a completion notification, inspect durable job state, exit status, logs
+  and required artifacts before continuing the authorized work. A wait-only
+  pause with explicit notification-triggered continuation permission allows
+  that follow-up; a later request to stop or an unrelated pause takes precedence.
+  If another dependency still requires waiting, retain the pause and its
+  notification rather than starting a polling loop.
+- Distinguish continuing work in the notified chat from resuming Goal's
+  automatic-turn status. Use a supported Goal-resume control only when available
+  and authorized. If it requires a client action, say so; never claim that a
+  queued notification changed the Goal to `active`. A failed notification or an
+  unavailable client does not justify silently starting a separate headless run.
+
+If automatic waiting turns recur, follow this pause workflow rather than
+repeating status-only replies. Missing permission or unavailable Goal controls
+are limitations to report, not reasons to invent a Goal transition.
 
 ## Cancel only when explicitly requested
 
@@ -87,6 +127,10 @@ mean the cancellation signal took effect.
 - Use `queue` to request the same thread-addressed transport explicitly. A
   delivery status of `queued` means the CLI accepted the message. It does not
   prove that the target session consumed or completed the resulting turn.
+  After queue
+  acceptance, a detached helper resumes an unloaded owner through the existing
+  daemon and starts only the existing completion item when the thread is idle.
+  Inspect `queue-wake.json` beside `state.json` for the separate wake result.
 - Use `tui` to require the originating tmux-hosted Codex CLI path. Delivery
   waits for both an idle turn and an empty composer before pasting. It never
   queues into a busy turn with `Tab`.
@@ -106,6 +150,10 @@ Confirm that the CLI in the tool environment supports `codex queue` and that the
 Use `--delivery auto --viewer none`; if queue delivery is unavailable, explain the limitation and use `event-only` when appropriate.
 Before retrying a `queued` notification, inspect the original conversation and durable job state; temporary absence from the interface does not justify resending it.
 Do not promise model execution while the window or remote connection is closed.
+An unselected or unloaded thread can be
+resumed without a UI click while its host and Codex daemon remain available.
+This does not restore a dead daemon, missing client-provided tools, or a network
+connection. See [unattended queue wake](references/operations.md#unattended-queue-wake).
 For recovery and environment limits, read [operations.md](references/operations.md#vs-code-client-recovery).
 
 ## Resume or rebind a session
@@ -118,6 +166,18 @@ permission from that resumed TUI:
 ```bash
 "$SKILL_ROOT/scripts/codex-long-jobs" rebind --all
 ```
+
+For a terminal `queue` job whose completion is already `queued`, recover the
+wake step without sending another completion message:
+
+```bash
+python3 "$SKILL_ROOT/scripts/queue_wake.py" --name <name>
+```
+
+The helper waits at most the job's delivery wait interval (24 hours by default).
+It uses no model calls while waiting. Existing workers retain their loaded
+runtime, so installing this patch does not retrofit an already-running job.
+Do not restart a healthy job to update notification behavior.
 
 Use `--name NAME` to bind one job. Rebind refuses a different
 `CODEX_THREAD_ID`. It can update an active job before completion or retry a

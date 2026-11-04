@@ -6,6 +6,7 @@
 - Terminal-state rules
 - Cancellation state machine
 - Queue delivery state machine
+- Unattended queue wake
 - TUI delivery state machine
 - Session exit and resume
 - tmux failure behavior
@@ -133,6 +134,47 @@ timeout or a delivery process that restarts after recording
 uncertainty and does not retransmit automatically, because the first invocation
 may already have enqueued the message. Normal repeated delivery workers also
 observe `queued` as final and do not send a second message.
+
+### Unattended queue wake
+
+A separate wake step follows queue acceptance. An
+unloaded thread can retain an accepted completion until a client resumes it;
+`queued` alone is therefore not an unattended-continuation guarantee.
+
+After successful queue acceptance, the controller launches `scripts/queue_wake.py`
+as a detached helper. It connects to the existing Codex daemon through the Unix
+control socket under the same `CODEX_HOME`, using the daemon's WebSocket JSON-RPC
+interface. It has no third-party Python dependencies and requires no systemd
+service. It never starts another daemon or a separate `codex exec` agent.
+
+The helper identifies the job's existing completion token, preserves queue
+order, and waits for an idle thread. If the owner is `notLoaded`, it calls
+`thread/resume` without changing the model, permissions, or instructions.
+Resume may consume the queue immediately. Otherwise, `thread/queue/start`
+addresses the same queued submission ID. An atomic server-side consumption
+race is resolved by re-reading the queue; the helper never re-enqueues input.
+
+Per-job `queue-wake.lock` prevents concurrent helpers. Evidence goes into
+`queue-wake.json` and diagnostics into `queue-wake.log`, beside `state.json`.
+The job's existing schema and `delivery.status: queued` remain unchanged.
+
+- `started`: the server returned a turn ID for this existing item.
+- `consumed-after-resume` / `consumed-concurrently`: the item left the queue
+  after a resume or a competing consumer. Verify the actual turn separately.
+- `absent`: the token is no longer queued; this alone does not prove completion.
+- `waiting-for-idle` / `waiting-for-earlier-input`: safe local waiting.
+- `pending` / `timed-out`: inspect the recorded error; no prompt was resent.
+
+The helper retries local readiness every 15 seconds for at most the job's
+`delivery.wait_seconds` (default 24 hours). No model polling occurs. A dead
+daemon, unavailable authentication, lost host, missing client-provided tools,
+or unsupported protocol can still prevent continuation. The interface is
+version-sensitive; repeat real acceptance after a Codex upgrade.
+
+For an already-queued old job, run `python3 scripts/queue_wake.py --name NAME`
+from this skill to attempt only the wake step. Upgrading the files does not
+replace a healthy worker's already-loaded code. Do not retry queue delivery
+just because the wake step failed, and do not change a paused Goal's status.
 
 `retry-delivery --use-queue` can migrate a terminal legacy TUI notification
 only when its durable state proves that no prompt was pasted, such as

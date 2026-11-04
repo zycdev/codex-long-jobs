@@ -147,6 +147,7 @@ class RuntimeTests(unittest.TestCase):
         env = self.env.copy()
         env.update(
             CODEX_THREAD_ID=thread,
+            CODEX_HOME=str(self.root / "isolated-codex-home"),
             CODEX_LONG_JOBS_CODEX_BIN=str(FAKE_CODEX),
             FAKE_CODEX_STATE_DIR=str(fake_root),
             TMUX="",
