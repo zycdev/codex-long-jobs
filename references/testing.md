@@ -317,7 +317,8 @@ No production process was stopped, no installed skill was synchronized, and no v
 The original contributor and merge commits remain in the development branch's ancestry.
 The implementation and exercised local acceptance are ready for review, subject to the coverage limits above.
 The maintainer subsequently authorized local commit preparation, as recorded below.
-Remote CI for these changes has not run because the branch has not been pushed; the maintainer retains the decisions to push, submit for review, and merge.
+Remote CI had not run at the local acceptance checkpoint because the branch had not yet been pushed.
+The subsequently authorized remote submission is tracked in [PR #5](https://github.com/zycdev/codex-long-jobs/pull/5), including its current CI results; merging remains a maintainer decision.
 
 ### Limited fallback check and local handoff (2026-11-09)
 
@@ -335,7 +336,8 @@ This confirms limited fallback delivery and duplicate suppression, not the compl
 After the test-import correction, the complete 152-test smoke suite, Ruff lint and formatting, ShellCheck, the Skill validator, and `git diff --check` passed again.
 Runtime source hashes still match the native and legacy UI acceptance above.
 The local commit contains only the 17 source, test, and documentation files; private receipts and logs remain outside version control.
-`VERSION` remains 0.4.2, and release, installed-skill synchronization, and remote GitHub operations remain deferred.
+`VERSION` remains 0.4.2; release and installed-skill synchronization remain deferred.
+Remote submission was authorized separately after this local handoff.
 
 ## Unattended queue wake acceptance
 
