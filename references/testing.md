@@ -336,8 +336,17 @@ This confirms limited fallback delivery and duplicate suppression, not the compl
 After the test-import correction, the complete 152-test smoke suite, Ruff lint and formatting, ShellCheck, the Skill validator, and `git diff --check` passed again.
 Runtime source hashes still match the native and legacy UI acceptance above.
 The local commit contains only the 17 source, test, and documentation files; private receipts and logs remain outside version control.
-`VERSION` remains 0.4.2; release and installed-skill synchronization remain deferred.
+At the local handoff, `VERSION` remained 0.4.2 and release and installed-skill synchronization were deferred.
 Remote submission was authorized separately after this local handoff.
+
+### v0.5.0 release preparation (2026-11-09)
+
+The maintainer subsequently authorized merging PR #5 and publishing v0.5.0.
+The minor version identifies the native-resume preference, independent wake recovery, executable discovery, and status diagnostics added since v0.4.2.
+The release preparation synchronizes `VERSION`, the runtime version constant, README status, and Changelog while retaining durable schema version 1.
+The runtime code change at this stage is limited to its version constant; the earlier acceptance records retain their original version and source-hash context.
+Publication uses an annotated tag on the tested merge commit and preserves Vandermode's original contribution history.
+Updating the installed skill remains outside the authorized release operation, so existing installations and running jobs are preserved.
 
 ## Unattended queue wake acceptance
 

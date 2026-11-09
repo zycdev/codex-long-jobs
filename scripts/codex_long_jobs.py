@@ -35,7 +35,7 @@ from typing import Any
 
 import codex_environment as codex_env
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 SCHEMA_VERSION = 1
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 THREAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,160}$")
