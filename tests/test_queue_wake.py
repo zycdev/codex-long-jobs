@@ -39,11 +39,21 @@ class FakeRpc:
                 self.entries = []
             return {"thread": {"status": {"type": self.status}}}
         if method == "thread/queue/start":
-            assert params == {"threadId": "thread", "queuedSubmissionId": "job-id"}
+            assert params == {"threadId": "thread"}
             self.entries = []
             if self.race:
                 raise qw.RpcError("already consumed")
-            return {"turn": {"id": "turn-id"}}
+            return {
+                "turn": {
+                    "id": "turn-id",
+                    "items": [
+                        {
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "done TOKEN"}],
+                        }
+                    ],
+                }
+            }
         raise AssertionError(method)
 
     def close(self):
@@ -107,7 +117,7 @@ class WakeTests(unittest.TestCase):
         )
         self.assertNotIn("thread/queue/start", [m for m, _ in rpc.calls])
 
-    def test_idle_starts_exact_existing_id(self):
+    def test_idle_starts_fifo_head_with_correlated_input(self):
         self.assertEqual(
             qw.wake(FakeRpc(), "thread", "TOKEN"),
             {"status": "started", "turn_id": "turn-id"},
@@ -131,7 +141,7 @@ class WakeTests(unittest.TestCase):
         self.assertEqual(
             qw.wake(rpc, "thread", "TOKEN")["status"], "waiting-for-earlier-input"
         )
-        self.assertEqual(len(rpc.calls), 1)
+        self.assertNotIn("thread/queue/start", [m for m, _ in rpc.calls])
 
     def test_missing_token_never_adds_message(self):
         rpc = FakeRpc()
@@ -139,12 +149,22 @@ class WakeTests(unittest.TestCase):
         self.assertEqual(len(rpc.calls), 1)
 
     def test_later_page_not_misreported_absent(self):
-        rpc = FakeRpc()
-        rpc.entries = []
-        rpc.next_cursor = "more"
+        rpc = FakeRpc("notLoaded")
+        original = rpc.call
+
+        def paged(method, params):
+            if method == "thread/queue/list":
+                if params.get("cursor") == "more":
+                    return {"data": rpc.entries, "nextCursor": None}
+                return {"data": [{"id": "earlier", "input": []}], "nextCursor": "more"}
+            return original(method, params)
+
+        rpc.call = paged
         self.assertEqual(
             qw.wake(rpc, "thread", "TOKEN")["status"], "waiting-for-earlier-input"
         )
+        self.assertIn("thread/resume", [m for m, _ in rpc.calls])
+        self.assertNotIn("thread/queue/start", [m for m, _ in rpc.calls])
 
     def test_ui_race_no_duplicate(self):
         rpc = FakeRpc(race=True)
@@ -203,6 +223,20 @@ class WakeTests(unittest.TestCase):
             root = Path(temp)
             with mock.patch.dict(os.environ, {"CODEX_LONG_JOBS_STATE_DIR": str(root)}):
                 (root / "jobs/test").mkdir(parents=True)
+                qw.jobs.atomic_write_json(
+                    root / "jobs/test/state.json",
+                    {
+                        "schema_version": 1,
+                        "name": "test",
+                        "status": "succeeded",
+                        "owner_thread_id": "thread",
+                        "delivery": {
+                            "mode": "queue",
+                            "status": "queued",
+                            "token": "TOKEN",
+                        },
+                    },
+                )
                 with mock.patch.object(qw.jobs.subprocess, "Popen") as popen:
                     qw.jobs.launch_queue_wake("test")
                     args, kwargs = popen.call_args
@@ -269,6 +303,42 @@ class WebSocketTests(unittest.TestCase):
         ws, _ = self.connect(b"\x81\x7f" + struct.pack("!Q", qw.MAX_MESSAGE + 1))
         with self.assertRaisesRegex(ConnectionError, "too large"):
             ws.receive(time.monotonic() + 1)
+
+    def test_slow_upgrade_headers_cannot_extend_connection_deadline(self):
+        sock = FakeSocket()
+        original = sock.recv
+        clock = [0.0]
+
+        def slow_recv(count):
+            clock[0] += 0.4
+            return original(count)
+
+        sock.recv = slow_recv
+        with (
+            mock.patch.object(qw.socket, "socket", return_value=sock),
+            mock.patch.object(qw.time, "monotonic", side_effect=lambda: clock[0]),
+            self.assertRaises(TimeoutError),
+        ):
+            qw.UnixWebSocket(Path("/tmp/test.sock"), timeout=1)
+        self.assertTrue(sock.closed)
+
+    def test_slow_frame_payload_cannot_extend_rpc_deadline(self):
+        ws, sock = self.connect()
+        sock.incoming = server_frame(json.dumps({"value": "x" * 200}).encode())
+        original = sock.recv
+        clock = [0.0]
+
+        def slow_recv(count):
+            clock[0] += 0.3
+            return original(count)
+
+        sock.recv = slow_recv
+        with (
+            mock.patch.object(qw.time, "monotonic", side_effect=lambda: clock[0]),
+            self.assertRaises(TimeoutError),
+        ):
+            ws.receive(1.0)
+        ws.close()
 
     def test_close_eof_and_deadline(self):
         for frame in [b"", server_frame(b"", opcode=8)]:

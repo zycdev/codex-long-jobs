@@ -10,6 +10,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 CLI = REPO / "scripts" / "codex_long_jobs.py"
+sys.path.insert(0, str(REPO / "scripts"))
 SPEC = importlib.util.spec_from_file_location("clj_helpers", CLI)
 assert SPEC and SPEC.loader
 RUNTIME = importlib.util.module_from_spec(SPEC)
