@@ -127,10 +127,9 @@ mean the cancellation signal took effect.
 - Use `queue` to request the same thread-addressed transport explicitly. A
   delivery status of `queued` means the CLI accepted the message. It does not
   prove that the target session consumed or completed the resulting turn.
-  After queue
-  acceptance, a detached helper resumes an unloaded owner through the existing
-  daemon and starts only the existing completion item when the thread is idle.
-  Inspect `queue-wake.json` beside `state.json` for the separate wake result.
+  Use native `queue --resume` when advertised by the selected executable.
+  After acceptance, the RPC helper provides wake-only recovery through the existing daemon, including for older CLIs.
+  Inspect `status --json` for the separate `queue_wake` observation; neither startup nor queue disappearance proves successful follow-up work.
 - Use `tui` to require the originating tmux-hosted Codex CLI path. Delivery
   waits for both an idle turn and an empty composer before pasting. It never
   queues into a busy turn with `Tab`.
@@ -146,14 +145,18 @@ have uncertain acceptance and remain pending without automatic retransmission.
 
 ## Codex extension for VS Code
 
-Confirm that the CLI in the tool environment supports `codex queue` and that the owner thread ID is available; the system CLI and extension-bundled app-server may differ.
+Use `doctor` to inspect the selected executable, version, and queue/resume capabilities when diagnosing an environment.
+Selection prefers `CODEX_LONG_JOBS_CODEX_BIN`, then trusted PATH, then a trusted extension-bundled binary; no standalone CLI is required when that fallback works.
+Confirm the owner thread ID is available. The extension App Server and shared daemon can have different versions and thread ownership.
+When `doctor` recommends CLI 0.166.0+ for native `queue --resume`, present it as optional, without repeating it on every job or performing an upgrade.
+Keep using an available RPC compatibility path; extension-only installations do not imply a mandatory standalone CLI upgrade.
 Use `--delivery auto --viewer none`; if queue delivery is unavailable, explain the limitation and use `event-only` when appropriate.
 Before retrying a `queued` notification, inspect the original conversation and durable job state; temporary absence from the interface does not justify resending it.
 Do not promise model execution while the window or remote connection is closed.
 An unselected or unloaded thread can be
 resumed without a UI click while its host and Codex daemon remain available.
-This does not restore a dead daemon, missing client-provided tools, or a network
-connection. See [unattended queue wake](references/operations.md#unattended-queue-wake).
+This does not restore a dead daemon, missing client-provided tools, or a network connection.
+A surviving App Server's writer lock must be respected; never kill or replace it to obtain access. See [unattended queue wake](references/operations.md#unattended-queue-wake).
 For recovery and environment limits, read [operations.md](references/operations.md#vs-code-client-recovery).
 
 ## Resume or rebind a session
@@ -171,11 +174,12 @@ For a terminal `queue` job whose completion is already `queued`, recover the
 wake step without sending another completion message:
 
 ```bash
-python3 "$SKILL_ROOT/scripts/queue_wake.py" --name <name>
+"$SKILL_ROOT/scripts/codex-long-jobs" retry-wake --name <name>
 ```
 
-The helper waits at most the job's delivery wait interval (24 hours by default).
-It uses no model calls while waiting. Existing workers retain their loaded
+The detached helper uses the job's delivery wait interval (24 hours by default), with bounded RPC calls.
+The existing supervisor can take over after helper failure; concurrent recovery requests do not resend the completion or reset an active attempt.
+It uses no model calls while waiting for readiness. Existing workers retain their loaded
 runtime, so installing this patch does not retrofit an already-running job.
 Do not restart a healthy job to update notification behavior.
 
@@ -211,6 +215,7 @@ Use these commands only when the user asks for status or delivery recovery:
 "$SKILL_ROOT/scripts/codex-long-jobs" status --name <name>
 "$SKILL_ROOT/scripts/codex-long-jobs" tail --name <name>
 "$SKILL_ROOT/scripts/codex-long-jobs" retry-delivery --name <name>
+"$SKILL_ROOT/scripts/codex-long-jobs" retry-wake --name <name>
 ```
 
 The `tail` command follows the log in the user's chosen terminal; provide it as an instruction rather than leaving the agent blocked in a live log stream.

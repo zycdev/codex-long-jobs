@@ -98,12 +98,22 @@ consumed or completed the new turn. Per-job locking suppresses normal duplicate
 dispatch. A timeout or interrupted invocation remains pending with uncertain
 acceptance instead of being resent automatically.
 
-After queue acceptance, a detached helper attempts to wake an unloaded owner
-through the existing local Codex daemon. It starts only the existing queued
-completion, preserves earlier input, and records the wake result separately.
-This uses an experimental, version-sensitive daemon interface; continuation is
-best effort and requires the host and daemon to remain available. See
-[unattended queue wake](references/operations.md#unattended-queue-wake).
+When the selected executable supports it, delivery uses native `codex queue --resume`.
+A detached RPC helper then provides wake-only recovery through the existing local daemon, including for older queue-capable CLIs.
+It resumes unloaded threads without bypassing earlier input, and the existing supervisor can recover a failed helper launch or abnormal exit.
+`status --json` exposes the independent `queue_wake` observation; `retry-wake --name NAME` retries only that step without sending another message.
+Queue acceptance, turn startup, and completed follow-up work remain separate facts.
+
+Executable selection prefers `CODEX_LONG_JOBS_CODEX_BIN`, then a trusted PATH CLI, then a trusted VS Code extension binary.
+`doctor` reports the selected executable and its actual capabilities.
+For a standalone CLI below 0.166.0 without native resume, it recommends an optional upgrade; older RPC-compatible installations remain usable and normal jobs do not repeat the advice.
+This does not install software or change the default CLI.
+
+Unattended continuation requires a reachable compatible daemon and access to the thread.
+A surviving extension App Server may hold its writer lock, and missing client tools can prevent a resumed turn from finishing.
+No process is forcibly replaced and no approval is granted by the helper.
+See [unattended queue wake](references/operations.md#unattended-queue-wake) for state meanings and recovery limits.
+The [acceptance records](references/testing.md#native-cli-and-mixed-version-isolated-acceptance-2026-11-08) distinguish real native-CLI tests with isolated model fixtures from supervised VS Code continuation tests.
 
 A terminal legacy TUI notification can be migrated with
 `retry-delivery --use-queue` only after its old delivery worker exits and its
@@ -537,7 +547,10 @@ The user confirmed interface display and recovery for the interactive scenarios.
 
 After the project window or remote connection closed, the job completed and the queue command returned success before reopening.
 The user observed the message briefly displayed as `steer` on reconnection, followed by normal conversation history and continuation.
-This establishes recovery after reconnection, not model execution while disconnected.
+These September 2026 observations establish recovery after reconnection.
+Subsequent tests on 2026-11-08 with the development runtime, CLI 0.164.0, extension 0.164.0-alpha.11.1, and daemon 0.167.0 verified real tool-based continuation before window reopening and before remote reconnection.
+The 2026-11-09 comparison with CLI 0.167.0 verified the same continuation boundaries, with native resume enabled and no resume warnings in the closed-window and disconnected cases.
+See the [supervised acceptance records](references/testing.md#staged-supervised-acceptance-2026-11-08) for the timing evidence and remaining limits.
 Do not resend an accepted notification merely because the client has not displayed it yet.
 
 Use `--delivery auto --viewer none`, inspect `status --json`, and view the log file in any terminal or editor.

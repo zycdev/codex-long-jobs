@@ -33,6 +33,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+import codex_environment as codex_env
+
 VERSION = "0.4.2"
 SCHEMA_VERSION = 1
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
@@ -60,8 +62,7 @@ def state_root() -> Path:
     override = os.environ.get("CODEX_LONG_JOBS_STATE_DIR")
     if override:
         return Path(override).expanduser().resolve()
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
-    return codex_home.expanduser().resolve() / "long-jobs"
+    return codex_env.codex_home() / "long-jobs"
 
 
 def ensure_private_dir(path: Path) -> None:
@@ -516,7 +517,7 @@ def tmux_binary() -> str:
 
 
 def codex_binary() -> str:
-    return os.environ.get("CODEX_LONG_JOBS_CODEX_BIN", "codex")
+    return codex_env.discover_codex()[0]
 
 
 def queue_timeout_seconds() -> float:
@@ -530,26 +531,10 @@ def queue_timeout_seconds() -> float:
 
 
 def detect_queue_capability() -> tuple[bool, str]:
-    try:
-        result = subprocess.run(
-            [codex_binary(), "queue", "--help"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=QUEUE_HELP_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError:
-        return False, "codex-unavailable"
-    except subprocess.TimeoutExpired:
-        return False, "queue-help-timeout"
-    except OSError as exc:
-        return False, f"queue-help-oserror:{exc.errno}"
-    if result.returncode != 0:
-        return False, f"queue-help-exit-{result.returncode}"
-    help_text = f"{result.stdout}\n{result.stderr}"
-    if "--thread" not in help_text or "--message" not in help_text:
-        return False, "queue-options-unavailable"
-    return True, "supported"
+    capabilities = codex_env.queue_capabilities(
+        codex_binary(), QUEUE_HELP_TIMEOUT_SECONDS
+    )
+    return capabilities["queue"], capabilities["reason"]
 
 
 def tmux_call(
@@ -857,7 +842,7 @@ def deliver_tui(name: str) -> None:
         os.close(fd)
 
 
-def deliver_queue(name: str) -> None:
+def deliver_queue(name: str, *, allow_possible_duplicate: bool = False) -> None:
     directory = job_dir(name)
     ensure_private_dir(directory)
     fd = os.open(delivery_lock_file(name), os.O_RDWR | os.O_CREAT, 0o600)
@@ -871,10 +856,13 @@ def deliver_queue(name: str) -> None:
             return
         delivery = record.get("delivery", {})
         if delivery.get("status") in DELIVERY_DONE:
+            if delivery.get("status") == "queued":
+                launch_queue_wake(name)
             return
         if (
             delivery.get("status") == "delivering"
             and delivery.get("reason") == "queue-command-running"
+            and not allow_possible_duplicate
         ):
             set_delivery(
                 name,
@@ -888,20 +876,30 @@ def deliver_queue(name: str) -> None:
         if not thread:
             set_delivery(name, "pending", "queue-thread-id-unavailable")
             return
+        if delivery.get("queue_acceptance_uncertain") and not allow_possible_duplicate:
+            return
+        binary, source = codex_env.discover_codex()
+        capabilities = codex_env.queue_capabilities(binary, QUEUE_HELP_TIMEOUT_SECONDS)
+        resume = capabilities["resume"]
         attempt = int(delivery.get("queue_attempts", 0)) + 1
         set_delivery(
             name,
             "delivering",
             "queue-command-running",
             queue_attempts=attempt,
+            codex_binary=binary,
+            codex_source=source,
+            queue_codex_home=str(codex_env.codex_home()),
+            queue_resume=resume,
             queue_started_at=now_iso(),
             queue_acceptance_uncertain=True,
         )
         try:
             result = subprocess.run(
                 [
-                    codex_binary(),
+                    binary,
                     "queue",
+                    *(["--resume"] if resume else []),
                     "--thread",
                     str(thread),
                     "--message",
@@ -949,21 +947,81 @@ def deliver_queue(name: str) -> None:
             queue_acceptance_uncertain=False,
             queue_exit_code=0,
             queued_at=now_iso(),
+            # Store a classification rather than arbitrary diagnostic text, which
+            # could include user configuration or credentials.
+            queue_resume_warning=resume
+            and "message was queued, but could not resume thread"
+            in result.stderr.lower(),
+            queue_diagnostics_present=bool(result.stderr.strip()),
         )
         launch_queue_wake(name)
     finally:
         os.close(fd)
 
 
-def launch_queue_wake(name: str) -> None:
+def validate_queue_wake(record: dict[str, Any]) -> None:
+    delivery = record.get("delivery", {})
+    if (
+        record.get("status") not in TERMINAL_STATUSES
+        or delivery.get("mode") != "queue"
+        or delivery.get("status") != "queued"
+        or not record.get("owner_thread_id")
+        or not delivery.get("token")
+    ):
+        raise JobError(
+            "wake requires a terminal job with an accepted queue notification"
+        )
+
+
+def read_queue_wake(name: str) -> dict[str, Any]:
+    try:
+        value = json.loads((job_dir(name) / "queue-wake.json").read_text())
+        if (
+            not isinstance(value, dict)
+            or not isinstance(value.get("status"), str)
+            or not value["status"]
+        ):
+            raise ValueError("wake evidence has no valid status")
+        identity = value.get("helper_identity")
+        if identity is not None and (
+            not isinstance(identity, dict)
+            or type(identity.get("pid")) is not int
+            or identity["pid"] <= 0
+        ):
+            raise ValueError("wake evidence has an invalid process identity")
+        if "deadline_at" in value and (
+            type(value["deadline_at"]) not in {int, float}
+            or not math.isfinite(value["deadline_at"])
+            or value["deadline_at"] <= 0
+        ):
+            raise ValueError("wake evidence has an invalid deadline")
+        attempts = value.get("attempts", 0)
+        unhandled = value.get("unhandled_requests", [])
+        if (
+            type(attempts) is not int
+            or attempts < 0
+            or not isinstance(unhandled, list)
+            or not all(isinstance(method, str) for method in unhandled)
+        ):
+            raise ValueError("wake evidence has invalid recovery metadata")
+        return value
+    except FileNotFoundError:
+        return {"status": "pending", "reason": "wake-not-started"}
+    except (OSError, ValueError, OverflowError):
+        return {"status": "pending", "reason": "wake-evidence-unreadable"}
+
+
+def launch_queue_wake(name: str, *, retry: bool = False) -> int | None:
     """Wake an unloaded owner after acceptance; never retransmit the prompt."""
+    validate_queue_wake(read_job(name))
     directory = job_dir(name)
     try:
         with open_log_for_append(directory / "queue-wake.log", create=True) as handle:
-            subprocess.Popen(
+            child = subprocess.Popen(
                 [
                     sys.executable,
                     str(Path(__file__).with_name("queue_wake.py")),
+                    *(["--retry"] if retry else []),
                     "--name",
                     name,
                 ],
@@ -973,15 +1031,47 @@ def launch_queue_wake(name: str) -> None:
                 start_new_session=True,
                 close_fds=True,
             )
+            return child.pid
     except OSError as exc:
-        atomic_write_json(
-            directory / "queue-wake.json",
-            {
-                "status": "pending",
-                "reason": f"wake-launch-failed:{exc.errno}",
-                "updated_at": now_iso(),
-            },
-        )
+        # A concurrent running helper owns its evidence. Never overwrite it.
+        fd = os.open(directory / "queue-wake.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return None
+            previous = read_queue_wake(name)
+            if previous.get("status") not in {
+                "started",
+                "consumed-after-resume",
+                "consumed-concurrently",
+            }:
+                atomic_write_json(
+                    directory / "queue-wake.json",
+                    {
+                        **previous,
+                        "status": "pending",
+                        "reason": f"wake-launch-failed:{exc.errno}",
+                        "updated_at": now_iso(),
+                    },
+                )
+        finally:
+            os.close(fd)
+        return None
+
+
+def supervise_queue_wake(name: str) -> None:
+    record = read_job(name)
+    if (
+        record.get("delivery", {}).get("mode") == "queue"
+        and record["delivery"].get("status") == "queued"
+    ):
+        # The existing supervisor waits on the helper lock. If the worker exits
+        # between acceptance and launch, or the helper crashes, it takes over.
+        # This creates no permanent service and never re-enters queue delivery.
+        import queue_wake
+
+        queue_wake.run(name, wait_for_lock=True)
 
 
 def launch_desktop_notification(record: dict[str, Any]) -> None:
@@ -1057,7 +1147,7 @@ def launch_headless(record: dict[str, Any]) -> None:
     )
 
 
-def dispatch_delivery(name: str) -> None:
+def dispatch_delivery(name: str, *, allow_possible_duplicate: bool = False) -> None:
     record = read_job(name)
     mode = record.get("delivery", {}).get("mode")
     if mode == "event-only":
@@ -1067,7 +1157,7 @@ def dispatch_delivery(name: str) -> None:
     elif mode == "headless":
         launch_headless(record)
     elif mode == "queue":
-        deliver_queue(name)
+        deliver_queue(name, allow_possible_duplicate=allow_possible_duplicate)
     else:
         deliver_tui(name)
 
@@ -1175,7 +1265,9 @@ def supervisor_main(name: str) -> int:
 
     record = update_job(name, supervising)
     if record.get("cancel_requested_at"):
-        return finalize_cancelled_before_launch(name)
+        result = finalize_cancelled_before_launch(name)
+        supervise_queue_wake(name)
+        return result
     runtime_log = job_dir(name) / "worker-runtime.log"
     try:
         with open_log_for_append(runtime_log, create=True) as handle:
@@ -1215,6 +1307,7 @@ def supervisor_main(name: str) -> int:
             and record.get("delivery", {}).get("status") not in DELIVERY_DONE
         ):
             finalize_delivery(name)
+        supervise_queue_wake(name)
         return return_code or 0
 
     cancel_requested = bool(record.get("cancel_requested_at"))
@@ -1269,6 +1362,7 @@ def supervisor_main(name: str) -> int:
 
     update_job(name, worker_failed)
     finalize_delivery(name)
+    supervise_queue_wake(name)
     return 1
 
 
@@ -1744,6 +1838,13 @@ def render_status(record: dict[str, Any]) -> str:
         f"delivery_status={delivery.get('status', 'unknown')}",
         f"delivery_reason={delivery.get('reason', 'unknown')}",
     ]
+    wake = record.get("queue_wake")
+    if wake:
+        rows.append(f"queue_wake_status={wake['status']}")
+        rows.append(f"queue_wake_reason={wake.get('reason', '')}")
+        rows.append(f"queue_wake_active={wake.get('active', False)}")
+        if wake.get("turn_id"):
+            rows.append(f"queue_wake_turn_id={wake['turn_id']}")
     if record.get("failure_reasons"):
         rows.append("failure_reasons=" + ";".join(record["failure_reasons"]))
     if record.get("cancel_requested_at"):
@@ -1772,6 +1873,12 @@ def command_status(args: argparse.Namespace) -> int:
                 records.append(read_job(path.parent.name))
             except (JobError, json.JSONDecodeError, OSError) as exc:
                 errors.append((path.parent.name, f"{exc.__class__.__name__}: {exc}"))
+    for record in records:
+        if record.get("delivery", {}).get("status") == "queued":
+            wake = read_queue_wake(record["name"])
+            wake["active"] = identity_alive(wake.get("helper_identity"))
+            wake["state_file"] = str(job_dir(record["name"]) / "queue-wake.json")
+            record["queue_wake"] = wake
     if args.json:
         print(
             json.dumps(
@@ -1840,10 +1947,17 @@ def command_cancel(args: argparse.Namespace) -> int:
     )
 
 
-def spawn_delivery(name: str) -> int:
+def spawn_delivery(name: str, *, allow_possible_duplicate: bool = False) -> int:
     log_path = job_dir(name) / "delivery-worker.log"
     return spawn_detached(
-        [sys.executable, str(Path(__file__).resolve()), "_deliver", "--name", name],
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "_deliver",
+            "--name",
+            name,
+            *(["--allow-possible-duplicate"] if allow_possible_duplicate else []),
+        ],
         cwd=read_job(name)["cwd"],
         log_path=log_path,
     )
@@ -1955,6 +2069,9 @@ def command_retry_delivery(args: argparse.Namespace) -> int:
         raise JobError("job does not use retryable queue or TUI delivery")
     if delivery.get("status") in DELIVERY_DONE:
         print("delivery already completed")
+        if mode == "queue" and delivery.get("status") == "queued":
+            pid = launch_queue_wake(name, retry=True)
+            print(f"queue_wake_pid={pid}; completion was not resent")
         return 0
     if args.use_queue and mode == "tui":
         if not record.get("owner_thread_id"):
@@ -1998,9 +2115,21 @@ def command_retry_delivery(args: argparse.Namespace) -> int:
         raise JobError(
             "queue acceptance is uncertain; inspect the owner thread before retrying or use --allow-possible-duplicate"
         )
-    pid = spawn_delivery(name)
+    # Pass acknowledgement to the locked dispatcher. Mutating an earlier
+    # snapshot here could overwrite a concurrent successful acceptance.
+    pid = spawn_delivery(name, allow_possible_duplicate=args.allow_possible_duplicate)
     print(f"delivery_worker_pid={pid}")
     return 0
+
+
+def command_retry_wake(args: argparse.Namespace) -> int:
+    if running_under_codex_sandbox():
+        raise JobError("wake retry requires scoped host execution to survive this call")
+    name = validate_name(args.name)
+    validate_queue_wake(read_job(name))
+    pid = launch_queue_wake(name, retry=True)
+    print(f"queue_wake_pid={pid}; completion was not resent")
+    return 0 if pid is not None else 1
 
 
 def command_view(args: argparse.Namespace) -> int:
@@ -2031,7 +2160,21 @@ def command_doctor(_: argparse.Namespace) -> int:
     print(f"state_root={state_root()}")
     print(f"tmux={shutil.which(tmux_binary()) or 'unavailable'}")
     print(f"tail={shutil.which('tail') or 'unavailable'}")
-    queue_supported, queue_reason = detect_queue_capability()
+    binary, source = codex_env.discover_codex()
+    capabilities = codex_env.queue_capabilities(binary, QUEUE_HELP_TIMEOUT_SECONDS)
+    version = codex_env.codex_version(binary)
+    queue_supported, queue_reason = capabilities["queue"], capabilities["reason"]
+    print(f"codex_binary={binary or 'unavailable'}")
+    print(f"codex_source={source}")
+    print(f"codex_version={version}")
+    print(f"codex_home={codex_env.codex_home()}")
+    print(f"queue_resume={capabilities['resume']}")
+    control = codex_env.codex_home() / "app-server-control/app-server-control.sock"
+    print(f"daemon_control_socket={control}")
+    print(f"daemon_socket_present={control.is_socket()}")
+    advice = codex_env.upgrade_advice(source, version, capabilities)
+    if advice:
+        print(f"advisory={advice}")
     print(f"queue_delivery={'available' if queue_supported else 'unavailable'}")
     print(f"queue_reason={queue_reason}")
     endpoint, reason = capture_endpoint()
@@ -2104,6 +2247,12 @@ def parser() -> argparse.ArgumentParser:
     )
     retry.set_defaults(func=command_retry_delivery)
 
+    wake = sub.add_parser(
+        "retry-wake", help="recover an accepted notification without resending it"
+    )
+    wake.add_argument("--name", required=True)
+    wake.set_defaults(func=command_retry_wake)
+
     view = sub.add_parser(
         "view", help="create or restore the disposable tmux log viewer"
     )
@@ -2130,7 +2279,15 @@ def parser() -> argparse.ArgumentParser:
 
     deliver = sub.add_parser("_deliver")
     deliver.add_argument("--name", required=True)
-    deliver.set_defaults(func=lambda args: (dispatch_delivery(args.name), 0)[1])
+    deliver.add_argument("--allow-possible-duplicate", action="store_true")
+    deliver.set_defaults(
+        func=lambda args: (
+            dispatch_delivery(
+                args.name, allow_possible_duplicate=args.allow_possible_duplicate
+            ),
+            0,
+        )[1]
+    )
     return root
 
 

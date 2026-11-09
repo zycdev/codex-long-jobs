@@ -37,7 +37,7 @@ If the supervisor alone is killed after the worker is running, the worker and
 command continue and can still complete normally. The runtime does not start a
 replacement supervisor, so any later worker failure would have no watchdog.
 
-Run `start`, `rebind`, and `retry-delivery` outside the Codex tool sandbox with
+Run `start`, `rebind`, `retry-delivery`, and `retry-wake` outside the Codex tool sandbox with
 scoped host permission. The sandbox owns and reaps its descendants even if they
 call `setsid`; the controller refuses to start when it detects that ancestor.
 
@@ -116,14 +116,16 @@ mechanism.
 
 ## Queue delivery state machine
 
-For `auto` delivery, the launcher checks the installed CLI locally with
+For `auto` delivery, the launcher checks the selected executable locally with
 `codex queue --help`. When `--thread` and `--message` are supported and an owner
 thread ID is available, the job records `mode: queue` and does not capture a
 tmux endpoint. Older CLIs retain the TUI transport.
 
 At terminal state, the delivery worker serializes per-job dispatch, records a
 `queue-command-running` attempt, and invokes `codex queue --thread OWNER
---message PROMPT`. Exit code zero changes the delivery status to `queued` with
+--message PROMPT`, adding `--resume` when the current executable advertises it.
+The helper starts only after that invocation returns, avoiding simultaneous native and RPC resume attempts.
+Exit code zero changes the delivery status to `queued` with
 reason `queue-command-accepted`. This proves only that the CLI accepted the
 message. Session-side execution and consumption are outside the transport
 acknowledgement.
@@ -132,49 +134,92 @@ A nonzero command result remains pending and may be retried explicitly. A
 timeout or a delivery process that restarts after recording
 `queue-command-running` has uncertain acceptance. The worker records that
 uncertainty and does not retransmit automatically, because the first invocation
-may already have enqueued the message. Normal repeated delivery workers also
+may already have enqueued the message.
+Explicit duplicate-risk acknowledgement is passed into the locked dispatcher; an earlier pending snapshot cannot overwrite a concurrent `queued` result.
+Normal repeated delivery workers also
 observe `queued` as final and do not send a second message.
+
+### Executable discovery and diagnostics
+
+Selection uses `CODEX_LONG_JOBS_CODEX_BIN` first, then a trusted executable on PATH, then installed `openai.chatgpt` extension packages under the user's standard VS Code extension directories or `VSCODE_AGENT_FOLDER`.
+The extension fallback checks publisher/name metadata, installed version ordering, the host platform, executable permission, and ownership of the executable and its ancestor directories.
+Automatically discovered paths must not be replaceable by other users; relative PATH entries are rejected.
+An explicit override is authoritative, including when it fails, and no fallback silently substitutes another executable.
+No PATH changes, installation, version switching, or daemon-package selection occur.
+Unrecognized extension layouts require an explicit trusted executable override or the existing TUI/event-only fallback.
+Run discovery outside a tool sandbox if its user namespace obscures filesystem ownership.
+
+`doctor` displays the selected path, source, version, queue and native resume capabilities, resolved `CODEX_HOME`, and control-socket presence.
+Unset or empty `CODEX_HOME` resolves to `~/.codex`; it does not mean the data directory is absent.
+Socket presence does not prove daemon readiness, RPC compatibility, authentication, or writer-lock availability.
+Diagnostics do not resume threads or restart services.
+Only `doctor` prints the optional recommendation for CLI versions below 0.166.0 that support queueing but lack `--resume`.
+Normal jobs do not repeat the recommendation; extension-only discovery does not recommend a mandatory standalone CLI installation or upgrade.
+Feature detection, rather than version comparison, selects the execution path.
 
 ### Unattended queue wake
 
-A separate wake step follows queue acceptance. An
-unloaded thread can retain an accepted completion until a client resumes it;
-`queued` alone is therefore not an unattended-continuation guarantee.
+Native `queue --resume` performs queue addition followed by an unloaded-thread check and optional resume.
+It can return success with a resume warning, so `delivery.status: queued` remains an acceptance acknowledgement only.
+`delivery.queue_resume` records whether the option was used, `queue_resume_warning` recognizes the native resume warning, and `queue_diagnostics_present` records other diagnostic output without persisting arbitrary CLI stderr.
+None of these fields establishes consumption or completed follow-up work.
+See the [upstream implementation](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/tui/src/session_queue_commands.rs).
+Isolated CLI 0.167.0 acceptance confirmed this warning behavior against both 0.167.0 and 0.164.0-alpha.11.1 servers; see the [test evidence](testing.md#native-cli-and-mixed-version-isolated-acceptance-2026-11-08) for its scope.
 
-After successful queue acceptance, the controller launches `scripts/queue_wake.py`
-as a detached helper. It connects to the existing Codex daemon through the Unix
-control socket under the same `CODEX_HOME`, using the daemon's WebSocket JSON-RPC
-interface. It has no third-party Python dependencies and requires no systemd
-service. It never starts another daemon or a separate `codex exec` agent.
+After acceptance, `scripts/queue_wake.py` provides wake-only recovery for both older CLIs and uncertain native outcomes.
+It connects to the existing daemon's Unix control socket using WebSocket JSON-RPC.
+New delivery records retain the accepted `queue_codex_home`, so explicit recovery uses the original home even if the caller's environment changes; older records fall back to the caller's resolved `CODEX_HOME`.
+It never adds a message, launches a daemon, changes thread permissions or model settings, or starts a separate headless agent.
+The existing supervisor participates through the same per-job lock and takes over if the worker exits between acceptance and helper launch, launch fails, or the helper exits abnormally.
+Either process can acquire the lock first; the recorded wake process identity can therefore belong to the supervisor.
+The same persisted deadline bounds takeover; there is no permanent additional service.
+If both supervisor and helper are lost, an explicit recovery command is required.
 
-The helper identifies the job's existing completion token, preserves queue
-order, and waits for an idle thread. If the owner is `notLoaded`, it calls
-`thread/resume` without changing the model, permissions, or instructions.
-Resume may consume the queue immediately. Otherwise, `thread/queue/start`
-addresses the same queued submission ID. An atomic server-side consumption
-race is resolved by re-reading the queue; the helper never re-enqueues input.
+The helper searches paginated queue results for the existing completion token.
+A `notLoaded` thread is resumed even when earlier user input precedes the completion; the server consumes the persisted queue in its existing order.
+If the completion remains behind earlier input, the helper waits.
+For an idle thread with the completion at the head, `thread/queue/start` selects the server's current head atomically, without a submission ID that could bypass concurrent user reordering.
+Active or pending turns are never interrupted. Queue races are resolved by rereading; no recovery path re-enqueues input.
 
-Per-job `queue-wake.lock` prevents concurrent helpers. Evidence goes into
-`queue-wake.json` and diagnostics into `queue-wake.log`, beside `state.json`.
-The job's existing schema and `delivery.status: queued` remain unchanged.
+Per-job `queue-wake.lock` serializes helper and supervisor recovery.
+`queue-wake.json` stores the independent observation, attempt count, deadline, and process identity; helper diagnostics go to `queue-wake.log`, with supervisor takeover diagnostics in `supervisor-runtime.log`.
+`status` and `status --json` expose `queue_wake` without modifying `state.json` or its schema version.
+The additional JSON field is a presentation field; existing delivery and command-result fields retain their meanings.
+Malformed wake evidence is reported as `wake-evidence-unreadable`; status inspection still displays the durable command result and does not rewrite either file.
 
-- `started`: the server returned a turn ID for this existing item.
-- `consumed-after-resume` / `consumed-concurrently`: the item left the queue
-  after a resume or a competing consumer. Verify the actual turn separately.
-- `absent`: the token is no longer queued; this alone does not prove completion.
-- `waiting-for-idle` / `waiting-for-earlier-input`: safe local waiting.
-- `pending` / `timed-out`: inspect the recorded error; no prompt was resent.
+| Wake status | Evidence and limits |
+| --- | --- |
+| `started` | A returned turn includes the target input; `turn_id` is correlated with that input. It does not establish completion. |
+| `consumed-after-resume` | The observed item disappeared after resumption. Deletion or another consumer cannot be distinguished from successful processing. |
+| `consumed-concurrently` | The observed item disappeared during a competing operation or a start whose response did not identify its input. |
+| `absent` | The target was not found. This is not a successful continuation acknowledgement. Explicit recovery may reinspect. |
+| `waiting-for-idle`, `waiting-for-earlier-input` | Safe local waiting, without interrupting a turn or bypassing input. |
+| `pending`, `timed-out` | Recovery failed or exhausted its interval. Queue acceptance remains intact. |
 
-The helper retries local readiness every 15 seconds for at most the job's
-`delivery.wait_seconds` (default 24 hours). No model polling occurs. A dead
-daemon, unavailable authentication, lost host, missing client-provided tools,
-or unsupported protocol can still prevent continuation. The interface is
-version-sensitive; repeat real acceptance after a Codex upgrade.
+When a start response lacks input correlation, `observed_turn_id` identifies only the observed queue-head turn, not necessarily the completion's turn.
+No wake status proves that required tools were available or that the subsequent task succeeded.
+Verify the actual turn, command artifacts, and logs separately.
 
-For an already-queued old job, run `python3 scripts/queue_wake.py --name NAME`
-from this skill to attempt only the wake step. Upgrading the files does not
-replace a healthy worker's already-loaded code. Do not retry queue delivery
-just because the wake step failed, and do not change a paused Goal's status.
+Recovery checks local readiness at intervals of up to 15 seconds for the job's `delivery.wait_seconds` (default 24 hours), with bounded RPC calls.
+Handshake and RPC transport operations use absolute deadlines, so partial reads or repeated control frames cannot extend an operation indefinitely.
+The helper checks the waiting deadline before starting each new recovery attempt; an already-running bounded RPC may finish afterward.
+These checks invoke no model while merely waiting; consuming the authorized notification can start model execution.
+A crash resumes the original deadline. An explicit retry starts a fresh interval only after obtaining the lock; concurrent retries do not reset an active attempt.
+`started` and the two disappearance observations suppress subsequent wake attempts, without claiming task success.
+`absent` and `timed-out` stop automatic attempts and remain explicitly retryable.
+
+Recover an accepted notification, including an older job without wake evidence:
+
+```bash
+scripts/codex-long-jobs status --name NAME --json
+scripts/codex-long-jobs retry-wake --name NAME
+```
+
+`retry-wake` requires terminal command state and an accepted queue notification.
+Its successful exit acknowledges helper launch, not completed recovery; inspect `status` for the outcome.
+For compatibility, `retry-delivery` on an already-queued job also performs only wake recovery; it never resends the completion, even with duplicate-risk acknowledgement.
+The low-level `python3 scripts/queue_wake.py --retry --name NAME` command provides the same bounded attempt synchronously.
+Installing files does not replace a healthy worker's loaded code. Do not restart healthy jobs or change Goal state to repair notification delivery.
 
 `retry-delivery --use-queue` can migrate a terminal legacy TUI notification
 only when its durable state proves that no prompt was pasted, such as
@@ -272,19 +317,33 @@ for workloads requiring host-crash recovery.
 ## VS Code client recovery
 
 The tested Linux Remote-SSH extension uses queue delivery without tmux.
-The CLI found through PATH must support `codex queue`; the extension's bundled app-server does not by itself establish that capability.
+The selected executable must support `codex queue`; it can come from PATH or the trusted extension fallback.
+The extension App Server and shared daemon are distinct processes, even when they share `CODEX_HOME`.
+Their versions need not match, and successful CLI feature detection does not prove compatible daemon RPCs.
 Inspect `doctor` and the recorded delivery mode when diagnosing a new installation.
 Use `event-only` if automatic queue delivery is unavailable and no validated TUI endpoint exists.
 
-After closing the project window or remote connection, the tested jobs completed and their messages were accepted before reopening.
+In the September 2026 acceptance, jobs completed and their messages were accepted before the project window or remote connection was reopened.
 On reconnecting, the user observed a brief `steer` state followed by history insertion and continuation in the original conversation.
 A `queued` record must not be retried merely because the interface is closed or its message has not yet appeared.
-Reopen the original conversation and inspect its history and durable job state first.
+Inspect durable job and wake state first; `retry-wake` can safely retry recovery without adding input.
+Reopen the original conversation when tools, authentication, or writer-lock ownership require its original client.
 If a connection failure or backend error requires Reload Window, restore the connection or reload, then inspect the original conversation before retrying delivery.
 Client-side proxy failure, extension app-server termination, and Server main-process termination recovered this way in the tested environment.
 These findings do not establish recovery from recursive process-tree loss, shared Codex daemon termination, or server-side network loss.
-Model execution while the client is disconnected is not established by these tests.
-See [the VS Code acceptance record](testing.md#recorded-vs-code-remote-ssh-acceptance) for the exact scope and reproduction procedure.
+If the original extension App Server exits while a compatible shared daemon remains, the helper can attempt a cold resume.
+If Remote-SSH disconnects while the original App Server remains alive, that server may still own the thread's writer lock.
+A competing resume must fail safely and remain pending; do not kill the owner or bypass its lock.
+If both servers are unavailable, the helper preserves acceptance and waits within its deadline; it does not create a replacement daemon.
+A loaded thread may already be consuming its queue, in which case recovery must defer to that consumer.
+The helper answers server-initiated tool or approval requests with `-32601`, records encountered method names without their arguments, and never grants approval or fabricates tool results.
+Requests after the helper disconnects are outside its observation window.
+Client-provided tools can therefore prevent a resumed turn from completing after the client closes.
+The September results establish recovery after reconnection.
+In the supervised November 2026 tests, the development runtime with CLI 0.164.0, extension 0.164.0-alpha.11.1, and daemon 0.167.0 produced actual tool-verification receipts before window reopening and before remote reconnection.
+The subsequent CLI 0.167.0 comparison preserved the extension and daemon versions and also verified those continuation boundaries, with initially unloaded threads and no native resume warnings in the closed-window and disconnected cases.
+Those successful cases require the observed host, daemon, and tool availability; they do not remove the failure boundaries above.
+See the [supervised acceptance records](testing.md#staged-supervised-acceptance-2026-11-08) and the [historical VS Code record](testing.md#recorded-vs-code-remote-ssh-acceptance) for their distinct scopes.
 
 ## Known limitations
 

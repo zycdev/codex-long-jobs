@@ -13,6 +13,30 @@ versions follow [Semantic Versioning](https://semver.org/).
 - Store separate wake evidence and provide a wake-only recovery helper.
 - Explain how to handle an active Goal while a background job runs.
 
+### Changed
+
+- Prefer runtime-detected native `queue --resume`; retain RPC recovery for older CLIs and uncertain native results without retransmitting accepted notifications.
+- Discover trusted PATH and VS Code extension executables after explicit overrides, and report executable selection, capabilities, and optional CLI upgrade advice through `doctor`.
+- Expose independent wake observations through `status`, and provide detached `retry-wake` recovery with a persisted waiting deadline and existing-supervisor takeover.
+
+### Fixed
+
+- Resume unloaded threads with preceding queued input, preserve FIFO under concurrent reordering, paginate queue inspection, and distinguish absence from confirmed turn startup.
+- Recover acceptance-to-launch gaps and abnormal helper exits without resetting automatic waiting budgets or creating a permanent service.
+- Preserve concurrent queue acceptance during explicit duplicate-risk retries, and retain original Codex-home and unsupported-client-request evidence across recovery.
+- Bound complete WebSocket/RPC operations despite partial progress, stop recovery attempts at the waiting deadline, and preserve command-status visibility when separate wake evidence is malformed.
+- Wait for valid PID content in the process-group cancellation test instead of only checking file existence.
+- Make standalone runtime tests resolve script imports without relying on another test module's import order.
+
+### Testing
+
+- Add deterministic native-resume, compatibility, discovery, recovery, concurrency, writer-lock, and unsupported-client-request regressions, plus an opt-in isolated real-CLI acceptance harness.
+- Record real old-CLI VS Code acceptance for online and busy continuation, conversation switching, and verified tool continuation before window reopening or remote reconnection.
+- Verify CLI 0.167.0 native resume against isolated servers from both 0.167.0 and extension 0.164.0-alpha.11.1, including failed-resume warnings, wake-only recovery, concurrent consumers, and switching back to a legacy CLI.
+- Record supervised CLI 0.167.0 continuation in online, busy, unselected, closed-window, and disconnected cases, including verified tool results before reopening or reconnection.
+- Exercise actual helper/supervisor process loss and acceptance-to-launch crashes, and verify three concurrent background jobs with six wake-recovery callers against an isolated old CLI.
+- Verify a limited compatibility fallback with five focused regressions and one isolated real tmux delivery and duplicate-suppression check.
+
 ## [0.4.2] - 2026-09-30
 
 ### Changed

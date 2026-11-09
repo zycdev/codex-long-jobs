@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "scripts"))
 CLI = REPO / "scripts" / "codex_long_jobs.py"
 FAKE_TMUX = REPO / "tests" / "fake_tmux.py"
 FAKE_CODEX = REPO / "tests" / "fake_codex.py"
@@ -51,7 +52,7 @@ class RuntimeTests(unittest.TestCase):
                     identities.append(identity)
             except (OSError, json.JSONDecodeError):
                 continue
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if not any(Path(f"/proc/{item['pid']}").exists() for item in identities):
                 break
@@ -277,9 +278,17 @@ class RuntimeTests(unittest.TestCase):
         running = self.launch_running("cancel-group", code)
         child_pid = int(running["child_pid"])
         deadline = time.monotonic() + 3
-        while not grandchild_file.exists() and time.monotonic() < deadline:
+        grandchild_pid = None
+        while time.monotonic() < deadline:
+            try:
+                value = grandchild_file.read_text(encoding="utf-8").strip()
+                if value.isdecimal() and int(value) > 0:
+                    grandchild_pid = int(value)
+                    break
+            except FileNotFoundError:
+                pass
             time.sleep(0.05)
-        grandchild_pid = int(grandchild_file.read_text(encoding="utf-8"))
+        self.assertIsNotNone(grandchild_pid, "child did not publish a complete PID")
 
         cancelled = self.cli(
             "cancel", "--name", "cancel-group", "--grace-seconds", "0.5"
@@ -346,9 +355,17 @@ class RuntimeTests(unittest.TestCase):
         )
         self.launch_running("cancel-after-eof", code)
         deadline = time.monotonic() + 3
-        while not grandchild_file.exists() and time.monotonic() < deadline:
+        grandchild_pid = None
+        while time.monotonic() < deadline:
+            try:
+                value = grandchild_file.read_text(encoding="utf-8").strip()
+                if value.isdecimal() and int(value) > 0:
+                    grandchild_pid = int(value)
+                    break
+            except FileNotFoundError:
+                pass
             time.sleep(0.05)
-        grandchild_pid = int(grandchild_file.read_text(encoding="utf-8"))
+        self.assertIsNotNone(grandchild_pid, "child did not publish a complete PID")
 
         result = self.cli(
             "cancel", "--name", "cancel-after-eof", "--grace-seconds", "0.2"
@@ -385,9 +402,17 @@ class RuntimeTests(unittest.TestCase):
         )
         self.launch_running("cancel-after-parent", code)
         deadline = time.monotonic() + 3
-        while not grandchild_file.exists() and time.monotonic() < deadline:
+        grandchild_pid = None
+        while time.monotonic() < deadline:
+            try:
+                value = grandchild_file.read_text(encoding="utf-8").strip()
+                if value.isdecimal() and int(value) > 0:
+                    grandchild_pid = int(value)
+                    break
+            except FileNotFoundError:
+                pass
             time.sleep(0.05)
-        grandchild_pid = int(grandchild_file.read_text(encoding="utf-8"))
+        self.assertIsNotNone(grandchild_pid, "child did not publish a complete PID")
         time.sleep(0.2)
 
         result = self.cli(
@@ -994,6 +1019,91 @@ class RuntimeTests(unittest.TestCase):
         retried = self.cli("retry-delivery", "--name", "queue-success", env=env)
         self.assertIn("delivery already completed", retried.stdout)
         self.assertEqual(len(attempts_path.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_native_resume_preferred_and_warning_never_requeues(self) -> None:
+        for suffix, mode in [("success", "success"), ("warning", "resume-warning")]:
+            with self.subTest(mode=mode):
+                env, fake_root = self.queue_env("thread-native-test")
+                env.update(
+                    FAKE_CODEX_QUEUE_HELP_MODE="resume", FAKE_CODEX_QUEUE_MODE=mode
+                )
+                name = "native-" + suffix
+                self.start_queue_job(name, env, wait_seconds=1)
+                record = self.wait_delivery(name, {"queued"})
+                self.assertTrue(record["delivery"]["queue_resume"])
+                self.assertEqual(
+                    record["delivery"]["queue_resume_warning"], mode == "resume-warning"
+                )
+                attempts_path = fake_root / "queue-attempts.jsonl"
+                before = attempts_path.read_bytes()
+                arguments = json.loads(before.decode().splitlines()[-1])
+                self.assertEqual(arguments[:2], ["queue", "--resume"])
+                self.assertEqual(arguments.count("--message"), 1)
+                self.cli("retry-wake", "--name", name, env=env)
+                self.cli("retry-delivery", "--name", name, env=env)
+                self.assertEqual(attempts_path.read_bytes(), before)
+                status = json.loads(
+                    self.cli("status", "--name", name, "--json", env=env).stdout
+                )
+                self.assertIn("queue_wake", status)
+                self.assertEqual(status["delivery"]["queue_attempts"], 1)
+
+    def test_upgrade_advisory_is_diagnostic_only(self) -> None:
+        env, _ = self.queue_env("thread-diagnostic-test")
+        doctor = self.cli("doctor", env=env)
+        self.assertIn("codex_version=0.164.0", doctor.stdout)
+        self.assertIn("advisory=Consider Codex CLI 0.166.0", doctor.stdout)
+        for index in range(2):
+            started = self.cli(
+                "start",
+                "--name",
+                f"no-advisory-{index}",
+                "--delivery",
+                "queue",
+                "--delivery-wait-seconds",
+                "1",
+                "--viewer",
+                "none",
+                "--",
+                sys.executable,
+                "-c",
+                "print('done')",
+                env=env,
+            )
+            self.assertNotIn("advisory=", started.stdout + started.stderr)
+            self.wait_delivery(f"no-advisory-{index}", {"queued"})
+
+    def test_explicit_uncertain_retry_reaches_worker_and_never_resends_queued(
+        self,
+    ) -> None:
+        thread = "thread-uncertain-retry"
+        env, fake_root = self.queue_env(thread)
+        state_path = self.write_terminal_job("uncertain-explicit", {}, thread)
+        record = json.loads(state_path.read_text())
+        record["delivery"].update(
+            mode="queue", queue_acceptance_uncertain=True, queue_attempts=1
+        )
+        state_path.write_text(json.dumps(record))
+        self.cli(
+            "retry-delivery",
+            "--name",
+            "uncertain-explicit",
+            "--allow-possible-duplicate",
+            env=env,
+        )
+        accepted = self.wait_delivery("uncertain-explicit", {"queued"})
+        self.assertEqual(accepted["delivery"]["queue_attempts"], 2)
+        attempts = fake_root / "queue-attempts.jsonl"
+        before = attempts.read_bytes()
+        self.assertEqual(len(before.splitlines()), 1)
+        self.cli(
+            "retry-delivery",
+            "--name",
+            "uncertain-explicit",
+            "--allow-possible-duplicate",
+            env=env,
+        )
+        self.assertEqual(attempts.read_bytes(), before)
 
     def test_auto_falls_back_to_tui_when_queue_is_unavailable(self) -> None:
         thread = "01a012c8-b9fd-7f23-98f5-5d6ed5b64df5"
