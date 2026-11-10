@@ -1,271 +1,183 @@
-# Codex Long Jobs: Background Jobs for Codex CLI and the Codex Extension for VS Code
+# Codex Long Jobs: Background Jobs and Automatic Session Wake-Up
 
 [![CI](https://github.com/zycdev/codex-long-jobs/actions/workflows/ci.yml/badge.svg)](https://github.com/zycdev/codex-long-jobs/actions/workflows/ci.yml)
 
-**Run long-running background jobs from Codex, end the current turn, and wake
-the original Codex session when the process finishes.**
+**Run long-running tasks in the background with no model polling, then wake the original Codex session to inspect results and continue authorized work.**
 
-`codex-long-jobs` is a Codex skill and local process supervisor for OpenAI
-Codex CLI and the Codex VS Code extension on tested Linux Remote-SSH hosts.
-It runs long-running background jobs and other background processes
-as detached OS processes. The current turn can end while a local worker waits
-for process completion with no LLM polling. When the command exits, the worker
-can wake the original Codex session through `codex queue`, with conservative
-tmux-hosted TUI delivery retained for older Codex CLI versions.
+`codex-long-jobs` is a skill and local process supervisor for OpenAI Codex CLI and the Codex extension for VS Code.
+It supports unattended continuation on tested Linux hosts, including Remote-SSH: start a job, let the current turn end, and receive a completion-triggered turn in the same conversation.
+Native `codex queue --resume` is preferred when available; an RPC helper retains compatibility and wake-only recovery.
 
-- Detached and async job execution on Linux servers and over SSH.
-- No LLM/model polling while a command is running.
-- Event-driven completion notification on success, failure, or abnormal exit.
-- Thread-addressed wake-up through `codex queue`, independent of tmux pane
-  identity when the installed CLI supports it.
-- Safe tmux-based compatibility delivery, with same-thread resume and rebind.
-- Durable job state, logs, exit code, signal, and delivery status.
-- Persistent log files and a log-following command for use in any terminal or IDE.
+> **v0.5.0 beta.** Requires Python 3.10+; Linux is the primary tested platform.
+> Automatic continuation depends on a reachable compatible Codex daemon and access to the original thread and required tools.
+> tmux is optional. See [compatibility and requirements](#compatibility-and-requirements).
 
-> Status: `v0.5.0` beta. Linux is the primary tested platform. Python 3.10 or
-> newer is required.
+## Quick Start
 
-tmux is not required for job execution, log inspection, or completion delivery through `codex queue`.
-It is an optional dependency for the legacy TUI notification transport and the convenience tmux viewer.
+### 1. Install the skill
 
-## Why codex-long-jobs? Run long-running processes without model polling
-
-A traditional agent workflow for a long build, training run, test suite, or
-benchmark often looks like this:
+In a Codex conversation on the host where your jobs will run, paste:
 
 ```text
-start process
--> periodically check status
--> another model turn
--> sleep
--> check again
+Install https://github.com/zycdev/codex-long-jobs as a user Codex skill and verify the installation.
 ```
 
-Those progress-only turns spend tokens and add noise to the conversation even
-though nothing yet requires model judgment. `codex-long-jobs` changes the flow:
+Restart Codex if the skill is not discovered, then confirm it appears in `/skills`.
+For an installation from a local clone, see [manual installation and updates](#manual-installation-and-updates).
+
+### 2. Run a background task
+
+From this repository, try:
 
 ```text
-start detached job
--> Codex turn ends
--> worker waits locally
--> process exits
--> completion event
--> original Codex session is queued or safely awakened
+Use $codex-long-jobs to run scripts/smoke_test.sh in the background without model polling. When it finishes, wake this original session, inspect the exit status and log, and summarize any failures.
 ```
 
-The model does not need to periodically poll the process. A multi-hour build,
-training run, benchmark, test suite, data processing job, or other long-running
-command can continue without consuming model turns just to check whether it has
-finished. This provides asynchronous process completion handling without
-keeping the agent turn open.
+In another project, replace `scripts/smoke_test.sh` with its test or build command.
+Codex starts the detached job, reports its name and log path, verifies the running state once, and ends the turn.
+The local worker waits for completion; the resulting Codex turn checks the evidence and performs only follow-up work you have authorized.
 
-## How wake-up works for the original Codex session
+Codex must launch the job with scoped host permission because its normal tool sandbox can reap detached descendants when the tool call ends.
+If automatic delivery is unavailable, the job can still record its result, but it will not wake the conversation automatically.
 
-At launch, the controller records the owner `CODEX_THREAD_ID`. When the
-installed CLI supports `codex queue --thread`, automatic delivery needs no tmux
-endpoint. Older CLIs retain the validated tmux pane and Codex process path. The
-supervisor, worker, and child command always run outside the viewer.
+### 3. Inspect or cancel when needed
+
+You can open the reported log file in any terminal or editor.
+For an on-demand check, ask:
 
 ```text
-Original Codex thread
-                    |
-                    | start and record owner UUID
-                    v
-       detached supervisor -> detached worker -> child process
-                    |                 |                |
-                    |                 |         runs for minutes or hours
-                    |                 |                |
-                    |                 +---- observe exit or cancel request
-                    |                                  |
-                    +---- detects worker failure       v
-                                      durable state, log, exit code or signal
-                                                       |
-                                                       v
-                                    codex queue --thread OWNER --message PROMPT
-                                                       |
-                                                       v
-                                      queued normal turn in the owner thread
-
-Older CLI compatibility branch:
-validate same thread, pane, and Codex PID
--> wait for TUI idle and composer empty
--> tmux paste-buffer plus safe Enter retry
+Use $codex-long-jobs to show the state and log path of the job you started in this conversation.
 ```
 
-Queue delivery records status `queued` only after the CLI returns success. This
-means the command accepted the message. It does not prove that the owner session
-consumed or completed the new turn. Per-job locking suppresses normal duplicate
-dispatch. A timeout or interrupted invocation remains pending with uncertain
-acceptance instead of being resent automatically.
-
-When the selected executable supports it, delivery uses native `codex queue --resume`.
-A detached RPC helper then provides wake-only recovery through the existing local daemon, including for older queue-capable CLIs.
-It resumes unloaded threads without bypassing earlier input, and the existing supervisor can recover a failed helper launch or abnormal exit.
-`status --json` exposes the independent `queue_wake` observation; `retry-wake --name NAME` retries only that step without sending another message.
-Queue acceptance, turn startup, and completed follow-up work remain separate facts.
-
-Executable selection prefers `CODEX_LONG_JOBS_CODEX_BIN`, then a trusted PATH CLI, then a trusted VS Code extension binary.
-`doctor` reports the selected executable and its actual capabilities.
-For a standalone CLI below 0.166.0 without native resume, it recommends an optional upgrade; older RPC-compatible installations remain usable and normal jobs do not repeat the advice.
-This does not install software or change the default CLI.
-
-Unattended continuation requires a reachable compatible daemon and access to the thread.
-A surviving extension App Server may hold its writer lock, and missing client tools can prevent a resumed turn from finishing.
-No process is forcibly replaced and no approval is granted by the helper.
-See [unattended queue wake](references/operations.md#unattended-queue-wake) for state meanings and recovery limits.
-The [acceptance records](references/testing.md#native-cli-and-mixed-version-isolated-acceptance-2026-11-08) distinguish real native-CLI tests with isolated model fixtures from supervised VS Code continuation tests.
-
-A terminal legacy TUI notification can be migrated with
-`retry-delivery --use-queue` only after its old delivery worker exits and its
-durable reason proves that no prompt was pasted. Ambiguous records require
-explicit duplicate-risk acknowledgement.
-
-The compatibility TUI boundary prevents a completion message from being pasted
-into a busy turn or a nonempty composer. A unique token, process identities,
-pane identity, and a cross-job delivery lock reduce stale-session and duplicate
-submission risks. The completion prompt contains state and log paths, not
-untrusted process output.
-
-This is event-driven from the model's perspective: the model is not invoked
-until the background process has actually completed and a completion message is
-delivered. The delivery worker can perform lightweight local TUI and tmux
-readiness checks. Those local checks do not invoke Codex and are not LLM/model
-polling.
-
-## Background job and detached process capabilities
-
-- **Durable execution.** The supervisor, worker, and command use independent OS
-  sessions with closed interactive stdin, so an ordinary Codex turn or tmux log
-  viewer does not own the job.
-- **Completion on success and failure.** Nonzero exits, signals, missing success
-  markers, log write failures, and unexpected worker exit all become terminal
-  state and use the same completion delivery path.
-- **Worker crash detection.** A separate supervisor detects worker failure,
-  stops the validated orphaned process group, records the failure, and triggers
-  delivery.
-- **Storage failure handling.** Partial writes and fsync failures are detected.
-  A small reserved state file improves the chance of recording failure when the
-  state filesystem is nearly full.
-- **Safe concurrent delivery.** Queue delivery is serialized per job and treats
-  accepted delivery as final. Compatibility TUI delivery waits for an idle TUI
-  and empty composer, serializes jobs globally, and retries a missed first
-  `Enter` without pasting another prompt.
-- **Session recovery.** Queue delivery continues by owner thread UUID. A pending
-  compatibility TUI job can be rebound after the original thread is resumed in
-  the same or a different tmux pane.
-- **Persistent inspection.** State, exit information, delivery status, and log paths remain available through `status`.
-  Follow logs with the skill's `tail` command or open the log file in any terminal or IDE.
-
-## Use cases for Codex background jobs on Linux and SSH
-
-Run long builds, training jobs, tests, benchmarks, and data pipelines from
-Codex without polling. Typical uses include:
-
-- long compilation jobs, release builds, and CUDA builds;
-- model training, fine-tuning, evaluation, and benchmark suites;
-- unit tests, integration tests, end-to-end tests, and large test suites;
-- data preprocessing, downloads, conversion, indexing, and batch processing;
-- simulations, migrations, package installation, and environment setup;
-- large code generation, compilation, packaging, and deployment pipelines.
-
-The primary environment is a Linux server reached over SSH. Supported Codex CLI versions can wake the owner thread through the local app-server daemon without tmux.
-Log inspection is independent of the notification transport and the window used to view the file.
-
-## Install the Codex skill
-
-Python 3.10 or newer is required.
-Automatic queue delivery also requires a supported Codex CLI, an owner thread ID, and access to the corresponding app-server daemon.
-Use `--viewer none` to run without a managed log-viewing window; log files and the `tail` command remain available.
-The default viewer is `none`, including inside tmux. Explicit `--viewer tmux` creates a viewer; explicit `--viewer auto` retains the previous environment-based selection.
-
-<details>
-<summary>Optional tmux setup for legacy TUI delivery or the convenience viewer</summary>
-
-Install tmux only if you want either of these optional features:
-
-```bash
-# Ubuntu or Debian
-sudo apt update && sudo apt install tmux
-
-# Conda
-conda install conda-forge::tmux
-
-# Homebrew on macOS or Linux
-brew install tmux
-
-# Pixi, installed globally from conda-forge
-pixi global install --channel conda-forge tmux
-```
-
-For legacy TUI delivery, verify the installation, start a tmux session, and launch Codex inside it:
-
-```bash
-tmux -V
-tmux new-session -s codex
-```
-
-Then run `codex` from the shell inside the new tmux session.
-
-</details>
-
-From an existing Codex session, a new user can ask Codex to perform the
-installation:
+To stop it explicitly:
 
 ```text
-Install https://github.com/zycdev/codex-long-jobs as a user Codex skill and tell me when it is ready.
+Use $codex-long-jobs to cancel the job you started in this conversation and report its final state.
 ```
 
-After Codex completes the installation, the new skill is available on the next
-turn. Contributors and other users who keep a working clone should install a
-fixed release worktree instead of linking Codex directly to the active checkout:
+Closing a log viewer does not cancel the job.
+A successful command still needs its outputs checked before Codex reports the task as complete.
 
-```bash
-git clone https://github.com/zycdev/codex-long-jobs.git \
-  "$HOME/workspaces/codex-long-jobs"
-cd "$HOME/workspaces/codex-long-jobs"
-python scripts/install_skill.py install             # dry run
-python scripts/install_skill.py install --yes       # link the local main commit
-python scripts/install_skill.py verify
+**Explore:** [Why use it?](#why-codex-long-jobs) · [Features](#key-features) · [Compatibility](#compatibility-and-requirements) · [How it works](#how-session-wake-up-works) · [Advanced usage](#advanced-usage-and-recovery) · [FAQ](#faq) · [Testing](#testing-and-contributing)
+
+## Why codex-long-jobs?
+
+Long builds, test suites, model training, evaluations, and data pipelines often need little attention while they run.
+Keeping an agent active just to ask whether a command has finished adds progress-only model turns.
+This skill delegates waiting to a local process and returns control to Codex when there is a result to inspect.
+
+```text
+Codex starts the job and ends its turn
+    -> detached worker waits locally
+    -> command finishes, fails, or is cancelled
+    -> completion is delivered to the original thread
+    -> Codex inspects results and continues authorized work
 ```
 
-The installer is offline. It creates a detached worktree under
-`${XDG_STATE_HOME:-$HOME/.local/state}/codex-long-jobs/release`, records the
-resolved commit, and links `${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs`
-to it. Development changes do not affect the installed skill until the installer
-is run again. Use `--ref TAG_OR_COMMIT` to pin or roll back explicitly.
+Ordinary background-process tools can keep commands running, but do not themselves connect completion to the owning Codex conversation.
 
-Restart Codex, then confirm the skill appears in `/skills`.
-Private job state defaults to `${CODEX_HOME:-$HOME/.codex}/long-jobs`.
+| Capability | `nohup` / shell background job | Ordinary tmux job | `codex-long-jobs` |
+| --- | --- | --- | --- |
+| Keep a command running independently of the current turn | With appropriate shell and host policy | Yes | Detached worker and supervisor |
+| Retain structured exit status, failure reasons, and log paths | Manual setup | Manual setup | Built in |
+| Notify and wake the original Codex thread | Manual integration | Manual integration | Queue delivery and wake recovery, subject to client availability |
+| Keep running after the log viewer closes | Depends on setup | Depends on session lifecycle | Yes; the viewer does not own the job |
 
-## Update notifications
+The worker uses no model tokens while waiting.
+Starting the job and handling completion remain normal Codex turns.
+There is no universal token-saving claim: a single foreground tool call that blocks until exit may already avoid intermediate model turns.
 
-New installations enable release checks once per week and explain how to change this setting.
-Checks occur on skill use only after the configured interval has elapsed since installation or the previous attempt.
-A newer release produces a notification; installation always requires an explicit user request.
-Network failures do not block job operations, and existing preferences survive reinstallation.
+## Key Features
+
+- **Original-session wake-up.** Completion targets the recorded Codex thread, with native `queue --resume` preferred and RPC compatibility recovery retained.
+- **No model polling.** Local processes supervise execution and wait for delivery readiness without progress-only model calls.
+- **Durable results.** Persistent logs and structured state retain exit codes, signals, failure reasons, and delivery status on success or failure.
+- **Separate delivery and wake recovery.** Accepted queue notifications are not retransmitted. `retry-wake` retries recovery without adding another message.
+- **Explicit cancellation.** Stop the validated command process group with graceful termination and bounded escalation.
+- **Failure handling.** A supervisor detects worker loss; log-write errors and missing optional success markers prevent a false success result.
+- **Terminal-independent logs.** Read the log in a terminal or IDE, or request an optional tmux viewer.
+
+## Compatibility and Requirements
+
+| Component | Requirement or tested boundary |
+| --- | --- |
+| Host | Linux is the primary tested platform. Jobs are host-local and subject to host process policy. Native Windows is unsupported; other platforms do not have equivalent acceptance coverage. |
+| Python | Python 3.10+; no third-party Python runtime dependencies. |
+| Codex CLI or VS Code extension | Queue delivery needs an owner thread ID and a selected executable supporting `codex queue --thread`. Unattended continuation also needs a compatible reachable daemon, thread access, and required tools. |
+| Native resume | Used when the selected executable advertises `queue --resume`. Older queue-capable CLIs can use the RPC compatibility path. |
+| tmux | Optional for the log viewer and required only for legacy TUI delivery. It does not supervise the job. |
+| Launch permission | Scoped host execution outside the Codex tool sandbox. |
+
+Executable discovery checks `CODEX_LONG_JOBS_CODEX_BIN` first, then a trusted PATH CLI, then a trusted VS Code extension binary.
+A standalone CLI is unnecessary when the extension fallback works.
+The extension App Server and shared daemon are distinct processes and can have different versions.
+
+To inspect the selected executable and its actual capabilities:
 
 ```bash
 SKILL_ROOT="${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs"
-python3 "$SKILL_ROOT/scripts/check_updates.py" status
-python3 "$SKILL_ROOT/scripts/check_updates.py" configure --enabled no
-python3 "$SKILL_ROOT/scripts/check_updates.py" configure --enabled yes --interval 2w
+"$SKILL_ROOT/scripts/codex-long-jobs" doctor
 ```
 
-See [release checks and manual updates](references/updates.md) for installation initialization, timing, and update procedures.
+For a standalone CLI below 0.166.0 without native resume, `doctor` can recommend an optional upgrade.
+It does not install software or change the default CLI, and normal jobs do not repeat the recommendation.
+Execution uses detected capabilities rather than version numbers alone.
 
-## Codex CLI example: run deep learning model training in the background
+### Verified VS Code Remote-SSH continuation
 
-For example, ask an OpenAI Codex CLI session to launch a multi-hour deep learning training run:
+The November 2026 acceptance covered online and busy conversations, an unselected conversation, deliberate window closure, and deliberate Remote-SSH disconnection.
+With CLI 0.167.0, extension binary 0.164.0-alpha.11.1, and daemon 0.167.0, actual tool verification completed **before reopening the window or reconnecting** in the closed-window and disconnected cases.
+The maintainer confirmed the resulting replies in the original conversation after returning.
+Earlier November tests also verified continuation with the older CLI 0.164.0 compatibility path.
+
+These are specific tested environments, not a guarantee for arbitrary network failures or client shutdowns.
+A surviving App Server may retain the thread's writer lock; missing client-provided tools, authentication, or an unavailable daemon can prevent continuation.
+The helper does not replace a daemon, bypass a writer lock, or grant approval.
+See the [supervised acceptance records](references/testing.md#staged-supervised-acceptance-2026-11-08) and [VS Code recovery limits](references/operations.md#vs-code-client-recovery).
+
+## How Session Wake-Up Works
+
+At launch, the controller records the owner `CODEX_THREAD_ID` and starts a detached supervisor, worker, and command outside tmux.
+After the command reaches terminal state, it persists the result and sends a completion prompt containing state and log paths to the original thread.
+Process output is treated as untrusted evidence and is not inserted into that prompt.
+
+When supported, delivery uses `codex queue --thread OWNER --message PROMPT --resume`.
+After acceptance, a detached RPC helper provides wake-only recovery through the existing local daemon, including for older queue-capable CLIs and uncertain native-resume outcomes.
+Recovery preserves earlier queued input and does not interrupt active turns.
+The existing supervisor can recover a failed helper launch or abnormal helper exit.
+
+**Queue acceptance, turn startup, and completed follow-up work are separate facts:**
+
+| Observation | What it establishes |
+| --- | --- |
+| `delivery.status: queued` | The CLI accepted the completion message. It does not prove the session consumed it. |
+| `queue_wake.status: started` | A correlated turn started with the target input. Its work may still fail. |
+| `queue_wake.status: absent` or a consumption observation | The item was not found or disappeared. This alone does not prove successful processing. |
+| Verified follow-up results | The actual continuation inspected state, logs, and required artifacts. This establishes task-specific success. |
+
+Accepted notifications are not resent, even when the interface has not displayed them.
+Timeouts or interrupted queue invocations with uncertain acceptance remain pending for inspection rather than automatic retransmission.
+Use `status --json` for command results and the independent `queue_wake` observation.
+
+On older CLIs without queue support, compatibility delivery validates the original tmux-hosted TUI and waits for an idle turn and empty composer.
+Local readiness checks do not invoke a model.
+See [queue delivery](references/operations.md#queue-delivery-state-machine), [unattended wake recovery](references/operations.md#unattended-queue-wake), and [TUI delivery](references/operations.md#tui-delivery-state-machine) for the full contracts.
+
+## Advanced Usage and Recovery
+
+### Training with artifact checks
+
+For a multi-hour training run, ask:
 
 ```text
-Run my model training with $codex-long-jobs without model polling. Wake this session when it finishes and verify the checkpoint.
+Run my model training with $codex-long-jobs without model polling. Wake this session when it finishes, verify the checkpoint and evaluation outputs, and report the results.
 ```
 
-The corresponding controller command can look like this:
+A corresponding controller command follows below.
+Replace the training script, configuration, and checkpoint paths with those in your project; choose a new job name for every run.
 
 ```bash
 SKILL_ROOT="${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs"
-
 "$SKILL_ROOT/scripts/codex-long-jobs" start \
   --name train-model-run-01 \
   --log ./logs/train-model-run-01.log \
@@ -273,7 +185,7 @@ SKILL_ROOT="${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs"
   --delivery auto \
   --viewer none \
   -- bash -c '
-    python train.py \
+    python3 train.py \
       --config configs/train.yaml \
       --output-dir checkpoints/run-01 &&
     test -f checkpoints/run-01/final.pt &&
@@ -281,329 +193,162 @@ SKILL_ROOT="${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs"
   '
 ```
 
-Codex must run `start` with scoped host permission. Its normal tool sandbox
-reaps detached descendants when the tool call ends, so the controller detects
-that condition and refuses to report a false detached launch.
+The marker is emitted only after training succeeds and the checkpoint exists.
+Success patterns use multiline regular-expression semantics, so `^TRAINING_COMPLETE$` matches one complete log line; omit the pattern only when exit code zero is sufficient.
+Checkpoint existence is still not semantic validation of the model or its evaluation results.
 
-The command prints the supervisor PID, log path, log-following command, durable state path, and delivery mode.
-An attach command is included only when an explicitly selected viewer starts successfully.
-After a one-time running-state check,
-let the Codex turn end. The local worker handles process completion. Success
-patterns use multiline regular-expression semantics, so `^TRAINING_COMPLETE$`
-matches one complete log line after any earlier output. In this example, the
-marker is emitted only after training exits successfully and the expected final
-checkpoint exists.
+### Status, logs, and cancellation
 
-## Job lifecycle commands: status, cancel, logs, delivery, and rebind
+Using the installed skill path above:
 
 ```bash
-# Show durable state, exit code, and delivery status
-scripts/codex-long-jobs status --name train-model-run-01
+# Inspect command results and independent delivery/wake evidence.
+"$SKILL_ROOT/scripts/codex-long-jobs" status --name train-model-run-01 --json
 
-# Follow the persistent log in the current terminal
-scripts/codex-long-jobs tail --name train-model-run-01
+# Follow the log in your own terminal.
+"$SKILL_ROOT/scripts/codex-long-jobs" tail --name train-model-run-01
 
-# Request cancellation and wait for durable terminal state
-scripts/codex-long-jobs cancel --name train-model-run-01
+# Explicitly stop the recorded process group and wait for terminal state.
+"$SKILL_ROOT/scripts/codex-long-jobs" cancel --name train-model-run-01
 
-# Optional: create or restore the convenience tmux log viewer
-scripts/codex-long-jobs view --name train-model-run-01
-
-# Rebind jobs after resuming the same original Codex thread
-scripts/codex-long-jobs rebind --all
-
-# Retry a terminal job whose queue or TUI delivery remains pending
-scripts/codex-long-jobs retry-delivery --name train-model-run-01
-
-# Safely migrate a legacy pending TUI notification to queue delivery
-scripts/codex-long-jobs retry-delivery \
-  --name train-model-run-01 \
-  --use-queue
-
-# Inspect runtime and TUI binding prerequisites
-scripts/codex-long-jobs doctor
+# Optional: create or restore a tmux log viewer.
+"$SKILL_ROOT/scripts/codex-long-jobs" view --name train-model-run-01
 ```
 
-The launcher and `status` print the log file path; `status --json` exposes it in the `log` field.
-Text output also provides a shell-quoted `log_follow` command that can be copied into any terminal on the job host.
-Open that file in your preferred terminal or IDE, or inspect the example job directly:
+`start` and `status` report the log path and a copyable `log_follow` command.
+The default `--viewer none` opens no managed window, including inside tmux.
+
+Cancellation sends `SIGTERM`, then escalates to `SIGKILL` after 10 seconds by default; `--grace-seconds` changes that interval.
+If natural completion wins before a signal takes effect, its actual result is retained.
+A zero exit from `cancel` means a durable terminal state was reached, not necessarily effective cancellation; inspect `status` and `cancel_effective_at`.
+Processes that escape the recorded OS session, scheduler jobs, and containers require their own cancellation mechanisms.
+
+### Recover an accepted notification
+
+If a terminal job is already `queued`, inspect its state and the original conversation, then retry only the wake step when needed:
 
 ```bash
-tail -n 200 -F ./logs/train-model-run-01.log
-less ./logs/train-model-run-01.log
+"$SKILL_ROOT/scripts/codex-long-jobs" retry-wake --name train-model-run-01
 ```
 
-These commands require no tmux session.
-The optional `view` command creates a tmux window for convenience; closing a log viewer does not stop the job or remove its log.
+Successful command exit confirms helper launch, not completed continuation.
+The helper waits locally within a bounded interval (24 hours by default) and does not resend the accepted message.
+Installing an update does not replace code already loaded by running workers; do not restart a healthy job to update notification behavior.
 
-For a shorter user-facing workflow, ask Codex:
-
-```text
-Cancel train-model-run-01 with $codex-long-jobs and report its final state.
-```
-
-`cancel` records a durable request, waits for the worker to stop the complete
-recorded process group, and returns only after the job reaches a terminal
-state. The worker sends `SIGTERM`, waits up to 10 seconds by default, and then
-uses `SIGKILL` if any member of the process group remains. An effective request
-ends as `cancelled` and follows the normal completion delivery path, so the
-owning Codex session can wake and inspect the result. If the command has already
-finished before any cancellation signal takes effect, its actual `succeeded`
-or `failed` result wins.
-
-Use `--grace-seconds SECONDS` to change the graceful-stop interval. Cancellation
-is process-group scoped; a child that deliberately escapes into another OS
-session, a scheduler allocation, or a container needs its own cancellation
-mechanism. Do not reuse a job name. Choose a new unique name so its durable
-history remains available.
-
-Lifecycle inspection is exposed through `status`, including stable JSON with
-`--json`, plus the persistent state and log files. There is no separate
-`result` command because terminal results are already part of the same durable
-job record.
-
-Exit status zero from `cancel` means the request reached a durable terminal
-state, not necessarily that a signal stopped the command. Read the printed
-`status` and `cancel_effective_at` fields, or use `status --json`, to distinguish
-effective cancellation from an already-completed job whose actual result won.
-
-## How codex-long-jobs differs from nohup, tmux, and command &
-
-`nohup command &`, a shell background process, or an ordinary tmux session can
-keep a command running. By themselves, they do not notify and wake the owning
-Codex conversation when the process completes.
-
-| Capability | `nohup` or `command &` | Ordinary tmux job | `codex-long-jobs` |
-| --- | --- | --- | --- |
-| Keep a command outside the current Codex turn | Yes, with correct shell handling | Yes | Yes, with a detached worker and supervisor |
-| Durable lifecycle metadata, exit status, and failure reasons | Manual | Manual | Built in |
-| Persistent combined log and optional success marker | Manual | Manual | Built in |
-| Track the owning Codex thread and optional TUI endpoint | No | No | Yes |
-| Wake or resume the original Codex session on completion | No | No | Yes, through `codex queue` or a validated compatibility TUI |
-| Protect against stale panes and support explicit rebind | No | No | Yes |
-| Keep the command alive if the optional viewer tmux server fails | Not applicable | Usually no | Yes |
-
-tmux remains available as a compatibility transport and optional log viewer. It
-is not the process supervisor.
-
-## How codex-long-jobs differs from model polling
-
-Model polling repeatedly invokes Codex to discover that a process is still
-running:
-
-```text
-Codex -> sleep -> status -> Codex -> sleep -> status
-```
-
-This project waits in a local process instead:
-
-```text
-Codex -> start
-worker -> wait locally for exit or an explicit cancel request
-process exits or is cancelled
-worker -> deliver completion
-Codex wakes
-```
-
-The worker also checks durable cancellation requests while the process is
-running. These checks are lightweight local process supervision, not model
-turns.
-
-The detached worker itself uses no model tokens. Starting the job and handling
-its completion are normal Codex turns, but progress-only model turns are not
-needed. Compatibility TUI delivery may use lightweight local readiness polling
-to wait for an idle TUI and empty composer. This is not LLM/model polling and
-does not consume model turns.
-
-No universal percentage token saving is claimed. If the alternative is one
-foreground tool call that blocks until exit without intermediate model turns,
-this skill can add small fixed orchestration overhead. Comparisons should count
-the same final result inspection and authorized follow-up work.
-
-## Resume and rebind Codex sessions after process completion
-
-The worker and command continue if the original Codex process exits. Queue-mode
-jobs continue to address the recorded thread UUID and require no pane rebind.
-For a pending compatibility TUI job, the old binding becomes invalid because
-its Codex process identity changed. After resuming the same original thread in
-any tmux pane, send Codex this prompt:
-
-```text
-I resumed the original Codex thread in this tmux pane. Use $codex-long-jobs to rebind its pending jobs to this TUI without polling them.
-```
-
-The skill performs the equivalent controller action:
+For pending legacy TUI delivery, resume the same original Codex thread inside tmux and run:
 
 ```bash
-scripts/codex-long-jobs rebind --all
+"$SKILL_ROOT/scripts/codex-long-jobs" rebind --all
 ```
 
-Rebind requires the current `CODEX_THREAD_ID` to match the job owner. It can be
-done before or after process completion. Without rebind, the completion event
-remains durably pending. Returning to the old pane alone is not sufficient, and
-a different Codex thread cannot claim the job.
+Queue-mode jobs do not require pane rebind.
+For unaccepted pending delivery, `retry-delivery --name NAME` retries delivery subject to its safety checks.
+Migration with `retry-delivery --name NAME --use-queue` requires the old delivery worker to have exited and durable evidence that no prompt was pasted; ambiguous records require explicit duplicate-risk acknowledgement.
+Read [session recovery](references/operations.md#session-exit-and-resume) and [queue recovery](references/operations.md#unattended-queue-wake) before intervening.
 
-## Completion delivery modes
+### Choose a delivery mode
 
-- `auto` selects queue delivery when the owner thread and `codex queue` are
-  available, falls back to TUI delivery on older CLIs, and otherwise records
-  durable event-only state.
-- `queue` explicitly requests thread-addressed queue delivery.
-- `tui` targets the validated tmux-hosted Codex CLI TUI.
-- `event-only` records completion without starting another Codex turn.
-- `headless` starts a separate `codex exec resume` only when explicitly
-  authorized. It does not guarantee live repainting of an already open TUI.
+| Mode | Behavior |
+| --- | --- |
+| `auto` | Prefer queue delivery when supported and an owner is known; otherwise use the validated legacy TUI path or durable event-only state. |
+| `queue` | Request thread-addressed queue delivery explicitly. |
+| `tui` | Require the validated tmux-hosted Codex CLI TUI. |
+| `event-only` | Record completion without starting another Codex turn. |
+| `headless` | Start a separate `codex exec resume` only with explicit authorization; live TUI synchronization is not guaranteed. |
 
-## FAQ: Codex background jobs and session wake-up
+### Manual installation and updates
 
-### How can I run a long-running command in Codex without polling it?
+For users maintaining a local clone, the offline installer creates a fixed release worktree so development edits do not affect the installed skill:
 
-Ask Codex to use this skill, or invoke `codex-long-jobs start` with a unique job
-name and command. After confirming the detached job reached `running`, end the
-turn. The local worker waits for completion without using model turns to check
-progress.
+```bash
+git clone https://github.com/zycdev/codex-long-jobs.git \
+  "$HOME/workspaces/codex-long-jobs"
+cd "$HOME/workspaces/codex-long-jobs"
+python3 scripts/install_skill.py install --ref v0.5.0        # Preview.
+python3 scripts/install_skill.py install --ref v0.5.0 --yes  # Install the pinned release.
+python3 scripts/install_skill.py verify
+```
 
-### Does codex-long-jobs use LLM polling?
+It links `${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs` to a detached worktree under `${XDG_STATE_HOME:-$HOME/.local/state}/codex-long-jobs/release`.
+Restart Codex to load the installed instructions.
+Private job state defaults to `${CODEX_HOME:-$HOME/.codex}/long-jobs`.
 
-No LLM/model polling occurs while the job is running. Queue delivery invokes one
-completion turn after the process exits. The compatibility delivery worker may
-check local tmux and TUI readiness until the owning TUI is idle and its composer
-is empty. These checks are ordinary local process work and do not invoke a
-model.
+New installations enable notification-only release checks once per week, performed on skill use when due.
+Updates require an explicit request; network failures do not block job operations, and reinstallation preserves preferences.
+To disable checks:
 
-### How can Codex automatically continue when a background process finishes?
+```bash
+SKILL_ROOT="${CODEX_HOME:-$HOME/.codex}/skills/codex-long-jobs"
+python3 "$SKILL_ROOT/scripts/check_updates.py" configure --enabled no
+```
 
-The worker queues a completion prompt to the recorded owner thread after the
-process reaches terminal state. On older CLIs, it uses the validated tmux-hosted
-TUI instead. The prompt starts a normal Codex turn and authorizes only inspection
-and follow-up work already authorized by that conversation.
+See [release checks and manual updates](references/updates.md) for intervals, initialization of copied installations, and update procedures.
 
-### Can a background process wake the original Codex CLI session?
+## FAQ
 
-Yes. Current CLIs accept a queued message addressed by owner thread UUID, and
-host acceptance confirms delivery after the TUI exits while the app-server
-daemon remains available. Older TUI-mode jobs require the original thread to be
-resumed and rebound; a different thread is rejected.
+### Does Codex auto resume work when VS Code or SSH is closed?
 
-### Why does codex-long-jobs still support tmux delivery?
+It can, while the remote host, compatible daemon, thread access, and required tools remain available.
+The [Remote-SSH acceptance](#verified-vs-code-remote-ssh-continuation) verified tool-based continuation before reopening or reconnection in specific configurations.
+Job survival and model continuation are separate: a detached job may finish even when Codex cannot resume.
+This is not a guarantee for arbitrary disconnection, host reboot, or daemon loss.
 
-Older Codex CLI versions do not provide `codex queue`. tmux supplies a
-verifiable pane identity and controlled terminal input path for that
-compatibility case. Job execution and current queue delivery are independent of
-the optional tmux viewer.
+### Does this eliminate all polling and model usage?
 
-### Does the job survive closing Codex?
+It eliminates model polling while waiting for the job.
+Local supervision checks process and cancellation state; recovery may check local readiness.
+Launch and completion handling use normal Codex turns, and authorized follow-up work can use further turns.
 
-Under normal host process policy, yes. The detached supervisor, worker, and
-command continue after the Codex process exits. Queue delivery can address the
-same owner thread through the persistent daemon. Compatibility TUI delivery
-waits until the thread is resumed in tmux and rebound. This is not a machine
-reboot guarantee.
+### Why is my job queued but Codex has not continued?
 
-### What happens if the original Codex session is restarted?
+`queued` confirms acceptance only.
+Inspect `status --json`, especially `queue_wake`, and check the original conversation.
+A busy thread, earlier input, writer lock, unavailable daemon, or missing client tools can delay or prevent continuation.
+Use [wake-only recovery](#recover-an-accepted-notification) rather than resending an accepted notification.
 
-Queue-mode completion still targets the recorded thread UUID. For TUI-mode
-delivery, resume the same thread, which preserves its `CODEX_THREAD_ID`, then
-run `rebind --name NAME` or `rebind --all` from the new tmux-hosted TUI. Rebind
-can target the original pane or a different pane.
+### Do I need tmux or a standalone Codex CLI?
 
-### Is this the same as nohup or command &?
+Neither is mandatory when queue delivery and trusted extension-binary discovery work.
+tmux remains an option for logs and the legacy TUI transport.
+Run `doctor` to inspect your environment; see [compatibility](#compatibility-and-requirements).
 
-No. Those tools can detach a process, but they do not add Codex owner identity,
-durable lifecycle state, abnormal-exit classification, safe completion
-delivery, original-session wake-up, or stale-session rebind protection.
+### Can I use it with an active Codex Goal?
 
-### Can Codex cancel a long-running background job?
+Yes, but completion notification does not manage the Goal lifecycle.
+An active Goal may otherwise generate additional waiting turns.
+Follow the [Goal-aware wait instructions](SKILL.md#goal-aware-waits), including explicit authorization for pausing a Goal; a queued notification alone does not change it back to `active`.
 
-Yes. Ask Codex to cancel the named job, or run
-`codex-long-jobs cancel --name NAME`. The worker terminates the recorded process
-group, escalates from `SIGTERM` to `SIGKILL` after the grace period when needed,
-persists `cancelled`, and sends the usual completion notification. Cancellation
-must be explicit; the skill does not stop a healthy job merely because Codex or
-the tmux viewer exits.
+### What are the safety and recovery limits?
 
-### How do I run background jobs from Codex CLI on a Linux server over SSH?
+Jobs do not survive machine reboot or loss of both worker and supervisor.
+A worker can finish after supervisor-only loss, but no replacement supervisor watches for a later worker failure.
+Use a service manager or cluster scheduler when host-crash recovery is required.
 
-Install the skill and start the job with scoped host permission. The detached
-process is designed to continue across an ordinary SSH disconnect, subject to
-the server's process and login-session policy. Current CLIs can deliver through
-the app-server daemon. Keep or restore a tmux-hosted Codex TUI only when using
-the compatibility transport.
+State records argv and working directory, so do not put secrets in command arguments.
+Completion prompts reference logs without inserting their contents; treat those logs as untrusted data.
+Notifications are best effort, and process completion does not prove artifact correctness.
+Full [security boundaries](references/operations.md#security-boundaries) and [known limitations](references/operations.md#known-limitations) are maintained in the operations reference.
 
-### How can Codex wait for a multi-hour job without using model turns to check progress?
+## Testing and Contributing
 
-The detached worker waits locally for process exit and checks only durable local
-cancellation state while Codex is inactive. Only actual process completion and
-successful prompt delivery start the next normal Codex turn.
-
-### Does it work with the Codex VS Code extension?
-
-Yes, in the tested Linux Remote-SSH environment with skill v0.4.1, extension `openai.chatgpt` version `26.917.62051`, and system Codex CLI `0.157.1` providing `codex queue`.
-The extension's bundled app-server and the CLI used by the skill are distinct processes; check the CLI available in the extension tool environment rather than assuming their versions or capabilities match.
-
-Real-session validation covered idle and busy sessions, two simultaneous completions, switching conversations, closing and reopening the chat panel, closing and reopening the project window, closing and restoring the remote connection, unexpected client-side connection loss, extension-backend and VS Code Server main-process termination, nonzero exit, and explicit cancellation.
-Completion messages reached the original conversation and triggered continuation without tmux.
-The user confirmed interface display and recovery for the interactive scenarios.
-
-After the project window or remote connection closed, the job completed and the queue command returned success before reopening.
-The user observed the message briefly displayed as `steer` on reconnection, followed by normal conversation history and continuation.
-These September 2026 observations establish recovery after reconnection.
-Subsequent tests on 2026-11-08 with the development runtime, CLI 0.164.0, extension 0.164.0-alpha.11.1, and daemon 0.167.0 verified real tool-based continuation before window reopening and before remote reconnection.
-The 2026-11-09 comparison with CLI 0.167.0 verified the same continuation boundaries, with native resume enabled and no resume warnings in the closed-window and disconnected cases.
-See the [supervised acceptance records](references/testing.md#staged-supervised-acceptance-2026-11-08) for the timing evidence and remaining limits.
-Do not resend an accepted notification merely because the client has not displayed it yet.
-
-Use `--delivery auto --viewer none`, inspect `status --json`, and view the log file in any terminal or editor.
-If `doctor` reports queue delivery unavailable, use event-only operation or a separately validated TUI environment; do not inject input into the VS Code interface.
-See [VS Code acceptance and reproduction](references/testing.md#recorded-vs-code-remote-ssh-acceptance) for the tested boundaries.
-
-## Safety and limitations for detached Codex jobs
-
-- Job output is untrusted data. Completion prompts point to logs but never
-  inject log contents into the TUI.
-- State stores argv and working directory. Do not put secrets in argv.
-- Cancellation targets the validated process group created for the command,
-  not processes that deliberately escape that OS session.
-- Queue command success proves acceptance, not consumption. Timeout and process
-  interruption therefore remain pending when acceptance is uncertain.
-- Compatibility TUI wake-up depends on Codex rendering and tmux input behavior,
-  so meaningful CLI changes require acceptance retesting.
-- Rebind is mandatory for TUI-mode delivery after the Codex process exits or
-  the displayed thread changes. Queue-mode delivery does not use pane identity.
-- The worker can finish and deliver after the supervisor alone is killed once
-  the job is running. No replacement supervisor is created, so a later worker
-  failure would no longer be detected.
-- Jobs do not survive machine reboot or loss of both supervisor and worker. Use
-  systemd, a cluster scheduler, or another service manager when host-crash
-  recovery is required.
-- Linux is the primary tested platform. Native Windows is unsupported.
-- Process completion is not semantic artifact validation. The completion turn
-  must inspect state, logs, and the requested outputs before claiming success.
-
-The project addresses the event-driven wake use case discussed in OpenAI Codex
-[#29922](https://github.com/openai/codex/issues/29922). A native Codex wake
-mechanism would be preferable if a stable public interface becomes available.
-
-See [operations and failure modes](references/operations.md) for recovery and
-security details. See [testing and release acceptance](references/testing.md)
-for the verified test matrix and environmental boundaries.
-
-## Testing and development for the Codex skill
+From a repository checkout:
 
 ```bash
 scripts/smoke_test.sh
-scripts/stress_test.sh 10
 scripts/coverage_test.sh
-python3 /path/to/skill-creator/scripts/quick_validate.py .
+scripts/stress_test.sh 10
+ruff check scripts/*.py tests
+ruff format --check scripts/*.py tests
+shellcheck scripts/codex-long-jobs scripts/*.sh
 ```
 
-The automated suite covers lifecycle, kernel and simulated write failures,
-signals, worker death, queue capability and failure paths, acceptance
-uncertainty, duplicate suppression, guarded migration, concurrent starts and
-deliveries, tmux viewer failure, busy-TUI deferral, missed-Enter retry,
-headless dispatch, notification safety, argument boundaries, path safety, and
-explicit session rebind. CI runs every supported Python minor version from
-3.10 through 3.14.
+CI covers Python 3.10 through 3.14 and enforces an 80% coverage threshold.
+The automated suite tests lifecycle failures, cancellation, queue and wake recovery, duplicate suppression, concurrency, argument and path safety, and legacy TUI behavior.
+Real-CLI tests with isolated model fixtures and supervised VS Code tests provide distinct evidence; neither implies universal client-version or platform coverage.
+
+See [testing and release acceptance](references/testing.md) for reproduction commands, Skill validation, dated results, and remaining coverage limits.
+Follow [AGENTS.md](AGENTS.md) when contributing and consult the [changelog](CHANGELOG.md) for release history.
+Open an issue before changing durable schema or delivery behavior.
 
 ## License
 
