@@ -1,5 +1,7 @@
 # Codex Long Jobs: Background Jobs and Automatic Session Wake-Up
 
+English | [中文](README.zh-CN.md)
+
 [![CI](https://github.com/zycdev/codex-long-jobs/actions/workflows/ci.yml/badge.svg)](https://github.com/zycdev/codex-long-jobs/actions/workflows/ci.yml)
 
 **Run long-running tasks in the background with no model polling, then wake the original Codex session to inspect results and continue authorized work.**
