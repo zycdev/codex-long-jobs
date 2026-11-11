@@ -27,15 +27,18 @@ For an installation from a local clone, see [manual installation and updates](#m
 
 ### 2. Run a background task
 
-From this repository, try:
+For example, in a model training project where Codex already knows the training command and configuration, ask:
 
 ```text
-Use $codex-long-jobs to run scripts/smoke_test.sh in the background without model polling. When it finishes, wake this original session, inspect the exit status and log, and summarize any failures.
+Run my model training in the background with $codex-long-jobs, then check the final checkpoint.
 ```
 
-In another project, replace `scripts/smoke_test.sh` with its test or build command.
 Codex starts the detached job, reports its name and log path, verifies the running state once, and ends the turn.
 The local worker waits for completion; the resulting Codex turn checks the evidence and performs only follow-up work you have authorized.
+
+You can continue interacting with Codex in the same conversation while training runs, including starting additional background jobs.
+Each job can wake that conversation when it finishes.
+With queue delivery, completion notifications wait for an active turn to finish and respect earlier queued input.
 
 Codex must launch the job with scoped host permission because its normal tool sandbox can reap detached descendants when the tool call ends.
 If automatic delivery is unavailable, the job can still record its result, but it will not wake the conversation automatically.
@@ -167,13 +170,7 @@ See [queue delivery](references/operations.md#queue-delivery-state-machine), [un
 
 ### Training with artifact checks
 
-For a multi-hour training run, ask:
-
-```text
-Run my model training with $codex-long-jobs without model polling. Wake this session when it finishes, verify the checkpoint and evaluation outputs, and report the results.
-```
-
-A corresponding controller command follows below.
+For the training task in [Quick Start](#2-run-a-background-task), the corresponding controller command can look like this.
 Replace the training script, configuration, and checkpoint paths with those in your project; choose a new job name for every run.
 
 ```bash
@@ -347,8 +344,9 @@ The automated suite tests lifecycle failures, cancellation, queue and wake recov
 Real-CLI tests with isolated model fixtures and supervised VS Code tests provide distinct evidence; neither implies universal client-version or platform coverage.
 
 See [testing and release acceptance](references/testing.md) for reproduction commands, Skill validation, dated results, and remaining coverage limits.
-Follow [AGENTS.md](AGENTS.md) when contributing and consult the [changelog](CHANGELOG.md) for release history.
-Open an issue before changing durable schema or delivery behavior.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and follow [AGENTS.md](AGENTS.md) for repository conventions.
+Use [GitHub Issues](https://github.com/zycdev/codex-long-jobs/issues) for bug reports, feature requests, and discussion before changing durable schema or delivery behavior.
+Consult the [changelog](CHANGELOG.md) for change history and [GitHub Releases](https://github.com/zycdev/codex-long-jobs/releases) for published versions and release notes.
 
 ## License
 
